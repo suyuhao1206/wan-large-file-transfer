@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+coverage/
+.DS_Store
+Thumbs.db
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.tmp
+
+backend/filecodebox-tus
+nginx/*.key
+nginx/*.pem
