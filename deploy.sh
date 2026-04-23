@@ -33,10 +33,21 @@ fi
 
 echo "Using compose command: $COMPOSE_CMD"
 echo "Project directory: $SCRIPT_DIR"
+DATA_ROOT="${DATA_ROOT:-/data}"
+echo "Data root: $DATA_ROOT"
 
 if [[ -d "nginx" ]]; then
   echo "Notice: Please make sure nginx domain, certificate, and key files are configured correctly before production deployment."
 fi
+
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "Error: DATA_ROOT directory does not exist: $DATA_ROOT"
+  echo "Please mount your data disk first and create the directory, for example:"
+  echo "  sudo mkdir -p $DATA_ROOT/postgres $DATA_ROOT/minio"
+  exit 1
+fi
+
+mkdir -p "$DATA_ROOT/postgres" "$DATA_ROOT/minio"
 
 echo "Stopping existing containers..."
 $COMPOSE_CMD down

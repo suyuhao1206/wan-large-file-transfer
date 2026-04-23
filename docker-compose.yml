@@ -49,8 +49,6 @@ services:
       - PORT=8080
       - API_KEY=${API_KEY:-}
       - ADMIN_KEY=${ADMIN_KEY:-}
-    volumes:
-      - tusd-data:/data/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,7 +64,7 @@ services:
       - POSTGRES_PASSWORD=filecodebox
       - POSTGRES_DB=filecodebox
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ${DATA_ROOT:-/data}/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U filecodebox"]
       interval: 10s
@@ -85,7 +83,7 @@ services:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
     volumes:
-      - minio-data:/data
+      - ${DATA_ROOT:-/data}/minio:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -97,8 +95,3 @@ services:
 networks:
   app-network:
     driver: bridge
-
-volumes:
-  postgres-data:
-  minio-data:
-  tusd-data:
