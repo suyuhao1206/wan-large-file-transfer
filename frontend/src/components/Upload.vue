@@ -8,16 +8,16 @@
       :on-change="handleFileChange"
       :show-file-list="false"
     >
-      <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+      <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
       <div class="el-upload__text">
-        将文件拖到此处或 <em>点击上传</em>
+        将文件拖到此处，或 <em>点击上传</em>
       </div>
     </el-upload>
 
     <div v-if="file" class="file-status">
       <p>{{ file.name }} ({{ formatSize(file.size) }})</p>
       <el-progress :percentage="progress" />
-      
+
       <div class="actions">
         <el-button type="primary" @click="startUpload" v-if="!uploading && !uploaded">
           开始上传
@@ -34,13 +34,20 @@
     <div v-if="uploaded" class="result-box">
       <el-result
         icon="success"
-        title="上传成功！"
-        sub-title="您的文件已准备好分享"
+        title="上传成功"
+        sub-title="您的文件已经准备好分享"
       >
         <template #extra>
           <div class="code-display">
-            <span>取件码:</span>
+            <span>取件码</span>
             <h1 class="code">{{ shareCode }}</h1>
+          </div>
+          <div v-if="uploadStats" class="stats-display">
+            <div class="stats-title">上传测试记录</div>
+            <p>开始时间：{{ formatDateTime(uploadStats.startedAt) }}</p>
+            <p>结束时间：{{ formatDateTime(uploadStats.finishedAt) }}</p>
+            <p>上传耗时：{{ uploadStats.durationText }}</p>
+            <p>平均速度：{{ uploadStats.averageSpeedMbps }} Mbps</p>
           </div>
         </template>
       </el-result>
@@ -62,15 +69,29 @@ const uploading = ref(false)
 const paused = ref(false)
 const uploaded = ref(false)
 const shareCode = ref('')
+const uploadStats = ref(null)
+const uploadStartedAt = ref(null)
+const pausedAt = ref(null)
+const pausedDurationMs = ref(0)
+
 let upload = null
+
+const resetUploadState = () => {
+  progress.value = 0
+  uploading.value = false
+  paused.value = false
+  uploaded.value = false
+  shareCode.value = ''
+  uploadStats.value = null
+  uploadStartedAt.value = null
+  pausedAt.value = null
+  pausedDurationMs.value = 0
+}
 
 const handleFileChange = (uploadFile) => {
   file.value = uploadFile.raw
-  progress.value = 0
-  uploaded.value = false
-  uploading.value = false
-  paused.value = false
-  shareCode.value = ''
+  upload = null
+  resetUploadState()
 }
 
 const formatSize = (bytes) => {
@@ -81,38 +102,96 @@ const formatSize = (bytes) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
 
-const startUpload = () => {
-  if (!file.value) return
+const formatDateTime = (date) => {
+  if (!date) return '-'
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(date)
+}
 
-  uploading.value = true
-  
-  // Get API key or Admin key
+const formatDuration = (durationMs) => {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const parts = []
+
+  if (hours > 0) parts.push(`${hours}小时`)
+  if (minutes > 0 || hours > 0) parts.push(`${minutes}分`)
+  parts.push(`${seconds}秒`)
+
+  return parts.join(' ')
+}
+
+const buildHeaders = () => {
   const apiKey = getApiKey()
   const adminKey = getAdminKey()
-  
-  // Prepare headers - prefer API key, fallback to Admin key
   const headers = {}
+
   if (apiKey) {
     headers['X-API-Key'] = apiKey
   } else if (adminKey) {
     headers['X-Admin-Key'] = adminKey
   }
-  
-  // 调试信息
-  console.log('Upload headers:', headers)
-  console.log('API Key:', apiKey)
-  console.log('Admin Key:', adminKey)
-  
+
+  return headers
+}
+
+const finishStats = () => {
+  const finishedAt = new Date()
+  const startedAt = uploadStartedAt.value || finishedAt
+  const durationMs = Math.max(
+    0,
+    finishedAt.getTime() - startedAt.getTime() - pausedDurationMs.value
+  )
+
+  const averageSpeedMbps = durationMs > 0
+    ? ((file.value.size * 8) / (durationMs / 1000) / 1000 / 1000).toFixed(2)
+    : '0.00'
+
+  uploadStats.value = {
+    startedAt,
+    finishedAt,
+    durationText: formatDuration(durationMs),
+    averageSpeedMbps
+  }
+}
+
+const startUpload = () => {
+  if (!file.value) return
+
+  uploading.value = true
+  uploaded.value = false
+  uploadStats.value = null
+
+  if (!uploadStartedAt.value) {
+    uploadStartedAt.value = new Date()
+    pausedDurationMs.value = 0
+  }
+
+  if (pausedAt.value) {
+    pausedDurationMs.value += Date.now() - pausedAt.value.getTime()
+    pausedAt.value = null
+  }
+
+  const headers = buildHeaders()
+
   upload = new tus.Upload(file.value, {
     endpoint: '/files/',
     retryDelays: [0, 3000, 5000, 10000, 20000],
-    headers: headers,
+    headers,
     metadata: {
       filename: file.value.name,
       filetype: file.value.type
     },
     onError: (error) => {
-      console.error('Failed because: ' + error)
+      console.error('Failed because:', error)
       ElMessage.error('上传失败: ' + error.message)
       uploading.value = false
     },
@@ -121,28 +200,24 @@ const startUpload = () => {
       progress.value = Number(percentage)
     },
     onSuccess: async () => {
-      console.log('Download %s from %s', upload.file.name, upload.url)
       uploading.value = false
       uploaded.value = true
-      
-      // Get the upload ID from the URL
+      finishStats()
+
       const uploadUrl = upload.url
       const uploadId = uploadUrl.substring(uploadUrl.lastIndexOf('/') + 1)
-      
-      // Call API to generate share code (axios 拦截器会自动添加密钥)
+
       try {
-          const res = await axios.post('/api/get-code', { upload_id: uploadId })
-          shareCode.value = res.data.code
-        } catch (err) {
-          console.error('Generate share code error:', err)
-          ElMessage.error('生成取件码失败')
+        const res = await axios.post('/api/get-code', { upload_id: uploadId })
+        shareCode.value = res.data.code
+      } catch (err) {
+        console.error('Generate share code error:', err)
+        ElMessage.error('生成取件码失败')
       }
     }
   })
 
-  // Check if there are any previous uploads to continue.
   upload.findPreviousUploads().then((previousUploads) => {
-    // Ask the user for their preference.
     if (previousUploads.length) {
       upload.resumeFromPreviousUpload(previousUploads[0])
     }
@@ -155,11 +230,16 @@ const pauseUpload = () => {
     upload.abort()
     uploading.value = false
     paused.value = true
+    pausedAt.value = new Date()
   }
 }
 
 const resumeUpload = () => {
   if (upload) {
+    if (pausedAt.value) {
+      pausedDurationMs.value += Date.now() - pausedAt.value.getTime()
+      pausedAt.value = null
+    }
     upload.start()
     uploading.value = true
     paused.value = false
@@ -172,12 +252,15 @@ const resumeUpload = () => {
   text-align: center;
   padding: 20px;
 }
+
 .file-status {
   margin-top: 20px;
 }
+
 .actions {
   margin-top: 15px;
 }
+
 .code-display {
   margin-top: 10px;
   background: #f0f9eb;
@@ -185,11 +268,30 @@ const resumeUpload = () => {
   border-radius: 8px;
   border: 1px solid #67c23a;
 }
+
 .code {
   color: #67c23a;
   font-size: 18px;
   margin: 10px 0;
   word-break: break-all;
   font-family: monospace;
+}
+
+.stats-display {
+  margin-top: 16px;
+  text-align: left;
+  background: #f4f4f5;
+  padding: 15px;
+  border-radius: 8px;
+  border: 1px solid #dcdfe6;
+}
+
+.stats-display p {
+  margin: 8px 0;
+}
+
+.stats-title {
+  font-weight: 600;
+  margin-bottom: 10px;
 }
 </style>
