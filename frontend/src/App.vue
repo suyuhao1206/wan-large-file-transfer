@@ -99,6 +99,61 @@
             <el-button type="success" @click="startDownload">点击下载</el-button>
           </div>
         </el-tab-pane>
+
+        <el-tab-pane label="传输记录" name="transfers">
+          <div class="records-box">
+            <div class="records-header">
+              <h3>传输记录</h3>
+              <el-button type="primary" @click="loadTransferRecords" :loading="loadingTransfers">
+                <el-icon><Refresh /></el-icon>
+                刷新
+              </el-button>
+            </div>
+
+            <el-table :data="transferRecords" style="width: 100%" v-loading="loadingTransfers">
+              <el-table-column prop="filename" label="文件名" min-width="220" show-overflow-tooltip />
+              <el-table-column prop="code" label="分享码" width="130">
+                <template #default="scope">
+                  <span class="code-cell">{{ scope.row.code }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="created_at" label="上传时间" width="180">
+                <template #default="scope">
+                  {{ formatDate(scope.row.created_at) }}
+                </template>
+              </el-table-column>
+              <el-table-column prop="expires_at" label="过期时间" width="180">
+                <template #default="scope">
+                  {{ scope.row.expires_at ? formatDate(scope.row.expires_at) : '长期有效' }}
+                </template>
+              </el-table-column>
+              <el-table-column label="下载次数" width="130">
+                <template #default="scope">
+                  {{ formatDownloads(scope.row) }}
+                </template>
+              </el-table-column>
+              <el-table-column prop="status" label="状态" width="110">
+                <template #default="scope">
+                  <el-tag :type="transferStatusType(scope.row.status)">
+                    {{ transferStatusText(scope.row.status) }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="190" fixed="right">
+                <template #default="scope">
+                  <el-button size="small" @click="copyShareCode(scope.row.code)">
+                    <el-icon><CopyDocument /></el-icon>
+                    复制
+                  </el-button>
+                  <el-button size="small" type="success" @click="downloadTransfer(scope.row)">
+                    <el-icon><Download /></el-icon>
+                    下载
+                  </el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </el-tab-pane>
         
         <!-- 仅管理员可见的 API 设置选项卡 -->
         <el-tab-pane label="API设置" name="settings" v-if="userIsAdmin">
@@ -258,7 +313,7 @@ import Upload from './components/Upload.vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getApiKey, setApiKey, getAdminKey, setAdminKey } from './config.js'
-import { Key, Lock, Plus } from '@element-plus/icons-vue'
+import { CopyDocument, Download, Key, Lock, Plus, Refresh } from '@element-plus/icons-vue'
 
 // 认证相关
 const showAuthDialog = ref(false)
@@ -282,6 +337,8 @@ const currentApiKey = ref('')
 const settingsTab = ref('use')
 const apiKeysList = ref([])
 const loadingKeys = ref(false)
+const transferRecords = ref([])
+const loadingTransfers = ref(false)
 const showCreateDialog = ref(false)
 const showKeyResult = ref(false)
 const newGeneratedKey = ref('')
@@ -453,6 +510,53 @@ const loadAPIKeys = async () => {
   }
 }
 
+const loadTransferRecords = async () => {
+  loadingTransfers.value = true
+  try {
+    const endpoint = userIsAdmin.value ? '/api/admin/files' : '/api/files'
+    const res = await axios.get(endpoint)
+    transferRecords.value = res.data.files || []
+  } catch (err) {
+    if (err.response?.status === 401) {
+      ElMessage.error('权限验证失败')
+    } else if (err.response?.status === 403) {
+      ElMessage.warning('当前密钥无法查看传输记录')
+    } else {
+      ElMessage.error('加载传输记录失败')
+    }
+  } finally {
+    loadingTransfers.value = false
+  }
+}
+
+const formatDownloads = (record) => {
+  if (!record) return '0'
+  if (!record.max_downloads) {
+    return `${record.downloads || 0} / 不限`
+  }
+  return `${record.downloads || 0} / ${record.max_downloads}`
+}
+
+const transferStatusText = (status) => {
+  if (status === 'expired') return '已过期'
+  if (status === 'download_limit') return '已达上限'
+  return '有效'
+}
+
+const transferStatusType = (status) => {
+  if (status === 'expired') return 'info'
+  if (status === 'download_limit') return 'danger'
+  return 'success'
+}
+
+const copyShareCode = (shareCode) => {
+  navigator.clipboard.writeText(shareCode).then(() => {
+    ElMessage.success('分享码已复制')
+  }).catch(() => {
+    ElMessage.error('复制失败')
+  })
+}
+
 const createNewKey = async () => {
   if (!newKeyForm.value.name) {
     ElMessage.warning('请输入名称')
@@ -547,6 +651,12 @@ watch(settingsTab, (newTab) => {
   }
 })
 
+watch(activeTab, (newTab) => {
+  if (newTab === 'transfers') {
+    loadTransferRecords()
+  }
+})
+
 const retrieveFile = async () => {
   if (!code.value) return
   loading.value = true
@@ -562,31 +672,45 @@ const retrieveFile = async () => {
   }
 }
 
+const withAuthQuery = (url) => {
+  const apiKey = getApiKey()
+  const adminKey = getAdminKey()
+
+  if (userIsAdmin.value && adminKey) {
+    const separator = url.includes('?') ? '&' : '?'
+    return `${url}${separator}admin_key=${encodeURIComponent(adminKey)}`
+  }
+
+  if (apiKey) {
+    const separator = url.includes('?') ? '&' : '?'
+    return `${url}${separator}api_key=${encodeURIComponent(apiKey)}`
+  }
+
+  if (adminKey) {
+    const separator = url.includes('?') ? '&' : '?'
+    return `${url}${separator}admin_key=${encodeURIComponent(adminKey)}`
+  }
+
+  return url
+}
+
+const triggerDownload = (url) => {
+  const link = document.createElement('a')
+  link.href = url
+  link.target = '_blank'
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+}
+
+const downloadTransfer = (record) => {
+  if (!record?.code) return
+  triggerDownload(withAuthQuery(`/files/${record.code}`))
+}
+
 const startDownload = () => {
   if (fileInfo.value) {
-    const apiKey = getApiKey()
-    const adminKey = getAdminKey()
-    let url = fileInfo.value.url
-    
-    // 下载链接需要在 URL 中添加密钥（因为是新窗口打开）
-    // 优先使用 API Key，如果只有 Admin Key 则使用 Admin Key
-    if (apiKey) {
-      const separator = url.includes('?') ? '&' : '?'
-      url = `${url}${separator}api_key=${encodeURIComponent(apiKey)}`
-    } else if (adminKey) {
-      const separator = url.includes('?') ? '&' : '?'
-      url = `${url}${separator}admin_key=${encodeURIComponent(adminKey)}`
-    }
-    
-    // 使用隐藏的 a 标签触发下载，避免 popup 拦截
-    const link = document.createElement('a')
-    link.href = url
-    // 如果是同源链接，download 属性可以强制下载；跨域（如 S3）则依赖 Content-Disposition
-    // link.download = fileInfo.value.filename 
-    link.target = '_blank'
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
+    triggerDownload(withAuthQuery(fileInfo.value.url))
   }
 }
 </script>
@@ -598,7 +722,7 @@ body {
   font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', '微软雅黑', Arial, sans-serif;
 }
 .container {
-  max-width: 800px;
+  max-width: 1100px;
   margin: 50px auto;
   padding: 20px;
 }
@@ -660,6 +784,19 @@ body {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 20px;
+}
+.records-box {
+  padding: 20px 0;
+}
+.records-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+.code-cell {
+  font-family: monospace;
+  font-weight: 600;
 }
 .key-display {
   font-family: monospace;

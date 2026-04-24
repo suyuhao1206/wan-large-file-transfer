@@ -99,6 +99,14 @@ func main() {
                     max_downloads INTEGER NOT NULL DEFAULT 0
                 )`)
                 _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_share_codes_upload ON share_codes(upload_id)`)
+                _, _ = db.Exec(`ALTER TABLE share_codes ADD COLUMN IF NOT EXISTS owner_key_hash TEXT`)
+                _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_share_codes_owner ON share_codes(owner_key_hash)`)
+                _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS upload_owners (
+                    upload_id TEXT PRIMARY KEY,
+                    owner_key_hash TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )`)
+                _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_upload_owners_owner ON upload_owners(owner_key_hash)`)
                 
                 // Create API keys table
                 _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS api_keys (
@@ -227,6 +235,7 @@ func main() {
 			if db != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
+				ownerHash := ownerHashForUpload(ctx, uploadID)
 				
 				// Retry loop for short code generation
 				for i := 0; i < 5; i++ {
@@ -235,8 +244,8 @@ func main() {
 					
 					// Try insert
 					res, err := db.ExecContext(ctx, 
-						"INSERT INTO share_codes(code, upload_id, filename, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,0) ON CONFLICT (code) DO NOTHING", 
-						shortCode, uploadID, filename, exp, maxDownloads)
+						"INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,$6,0) ON CONFLICT (code) DO NOTHING",
+						shortCode, uploadID, filename, nullableString(ownerHash), exp, maxDownloads)
 					
 					if err == nil {
 						if rows, _ := res.RowsAffected(); rows > 0 {
@@ -251,7 +260,7 @@ func main() {
 				// Better to leave it and let get-code handle it or use UploadID as last resort.
 				if shortCode == "" {
 					// Fallback to inserting UploadID as code to ensure record exists
-					_, _ = db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, max_downloads) VALUES($1,$2,$3,$4) ON CONFLICT (code) DO UPDATE SET filename=EXCLUDED.filename", uploadID, uploadID, filename, maxDownloads)
+					_, _ = db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, max_downloads) VALUES($1,$2,$3,$4,$5) ON CONFLICT (code) DO UPDATE SET filename=EXCLUDED.filename, owner_key_hash=COALESCE(share_codes.owner_key_hash, EXCLUDED.owner_key_hash)", uploadID, uploadID, filename, nullableString(ownerHash), maxDownloads)
 				}
 			}
 
@@ -461,7 +470,22 @@ func main() {
 		// 2. Handle Tusd Protocol (POST, PATCH, HEAD, etc.)
 		// Or GET without ID (listing? not supported by tusd usually)
 		// Pass to tusd
+		var ownerHash string
+		if c.Request.Method == http.MethodPost {
+			if value, exists := c.Get("api_key_hash"); exists {
+				if hash, ok := value.(string); ok {
+					ownerHash = hash
+				}
+			}
+		}
+
 		http.StripPrefix("/files/", tusHandler).ServeHTTP(c.Writer, c.Request)
+
+		if c.Request.Method == http.MethodPost && ownerHash != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
+			if uploadID := uploadIDFromLocation(c.Writer.Header().Get("Location")); uploadID != "" {
+				rememberUploadOwner(uploadID, ownerHash)
+			}
+		}
 	})
 
     // Health check endpoint (no authentication required)
@@ -553,6 +577,7 @@ func main() {
     api.Use(apiKeyAuth()) // Apply API key authentication to all API routes
     {
         api.POST("/get-code", getShareCode)
+        api.GET("/files", listUserFiles)
         api.GET("/retrieve/:code", retrieveFile)
         if enableDebug {
             api.GET("/debug/list-objects", listObjects)
@@ -566,6 +591,7 @@ func main() {
     {
         admin.POST("/keys", createAPIKey)
         admin.GET("/keys", listAPIKeys)
+        admin.GET("/files", listAdminFiles)
         admin.DELETE("/keys/:id", deleteAPIKey)
         admin.PATCH("/keys/:id", updateAPIKey)
     }
@@ -699,6 +725,7 @@ func apiKeyAuth() gin.HandlerFunc {
 		// Verify Admin Key first (highest priority)
 		if adminKeyProvided != "" && adminKey != "" && adminKeyProvided == adminKey {
 			log.Printf("Admin key authenticated for %s %s", c.Request.Method, c.Request.URL.Path)
+			c.Set("is_admin", true)
 			c.Next()
 			return
 		}
@@ -728,6 +755,8 @@ func apiKeyAuth() gin.HandlerFunc {
 		}
 
 		log.Printf("API key authenticated for %s %s", c.Request.Method, c.Request.URL.Path)
+		c.Set("api_key_hash", hashAPIKey(providedKey))
+		c.Set("is_admin", false)
 		c.Next()
 	}
 }
@@ -787,6 +816,17 @@ type APIKeyResponse struct {
 	CreatedAt   time.Time `json:"created_at"`
 	LastUsedAt  *time.Time `json:"last_used_at"`
 	ExpiresAt   *time.Time `json:"expires_at"`
+}
+
+type AdminFileRecord struct {
+	Code         string     `json:"code"`
+	UploadID     string     `json:"upload_id"`
+	Filename     string     `json:"filename"`
+	CreatedAt    time.Time  `json:"created_at"`
+	ExpiresAt    *time.Time `json:"expires_at"`
+	Downloads    int        `json:"downloads"`
+	MaxDownloads int        `json:"max_downloads"`
+	Status       string     `json:"status"`
 }
 
 func createAPIKey(c *gin.Context) {
@@ -882,6 +922,116 @@ func listAPIKeys(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"keys": keys})
+}
+
+func listAdminFiles(c *gin.Context) {
+	if db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Database not available"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	files, err := querySharedFiles(ctx, "", true)
+	if err != nil {
+		log.Printf("Failed to list uploaded files: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list files"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"files": files})
+}
+
+func listUserFiles(c *gin.Context) {
+	if db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Database not available"})
+		return
+	}
+
+	if isAdmin, _ := c.Get("is_admin"); isAdmin == true {
+		listAdminFiles(c)
+		return
+	}
+
+	value, exists := c.Get("api_key_hash")
+	ownerHash, ok := value.(string)
+	if !exists || !ok || ownerHash == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "API key ownership is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	files, err := querySharedFiles(ctx, ownerHash, false)
+	if err != nil {
+		log.Printf("Failed to list user files: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list files"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"files": files})
+}
+
+func querySharedFiles(ctx context.Context, ownerHash string, includeAll bool) ([]AdminFileRecord, error) {
+	args := []interface{}{}
+	whereClause := ""
+	if !includeAll {
+		whereClause = "WHERE owner_key_hash = $1"
+		args = append(args, ownerHash)
+	}
+
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT code, upload_id, filename, created_at, expires_at, downloads, max_downloads,
+			CASE
+				WHEN expires_at IS NOT NULL AND expires_at < NOW() THEN 'expired'
+				WHEN max_downloads > 0 AND downloads >= max_downloads THEN 'download_limit'
+				ELSE 'active'
+			END AS status
+		FROM share_codes
+		%s
+		ORDER BY created_at DESC
+		LIMIT 500
+	`, whereClause), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	files := make([]AdminFileRecord, 0)
+	for rows.Next() {
+		var file AdminFileRecord
+		var expiresAt sql.NullTime
+
+		err := rows.Scan(
+			&file.Code,
+			&file.UploadID,
+			&file.Filename,
+			&file.CreatedAt,
+			&expiresAt,
+			&file.Downloads,
+			&file.MaxDownloads,
+			&file.Status,
+		)
+		if err != nil {
+			log.Printf("Failed to scan shared file row: %v", err)
+			continue
+		}
+
+		if expiresAt.Valid {
+			exp := expiresAt.Time
+			file.ExpiresAt = &exp
+		}
+
+		files = append(files, file)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return files, nil
 }
 
 func deleteAPIKey(c *gin.Context) {
@@ -1028,6 +1178,7 @@ func getShareCode(c *gin.Context) {
         
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
+        ownerHash := ownerHashForUpload(ctx, req.UploadID)
 
         err := db.QueryRowContext(ctx, "SELECT code, filename, expires_at, downloads, max_downloads FROM share_codes WHERE upload_id=$1 ORDER BY created_at DESC LIMIT 1", req.UploadID).Scan(&code, &filename, &expires, &downloads, &maxd)
         if err == nil {
@@ -1046,7 +1197,7 @@ func getShareCode(c *gin.Context) {
         for i := 0; i < 5; i++ {
              newCode = genCode(8)
              exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
-             res, ierr := db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,0) ON CONFLICT (code) DO NOTHING", newCode, req.UploadID, filenameOrCache(req.UploadID), exp, maxDownloads)
+             res, ierr := db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,$6,0) ON CONFLICT (code) DO NOTHING", newCode, req.UploadID, filenameOrCache(req.UploadID), nullableString(ownerHash), exp, maxDownloads)
              if ierr == nil {
                  if rows, _ := res.RowsAffected(); rows > 0 {
                      c.JSON(200, gin.H{"code": newCode, "filename": filenameOrCache(req.UploadID)})
@@ -1215,6 +1366,60 @@ func filenameOrCache(uploadID string) string {
         }
     }
     return "unknown.bin"
+}
+
+func nullableString(value string) sql.NullString {
+	return sql.NullString{String: value, Valid: value != ""}
+}
+
+func uploadIDFromLocation(location string) string {
+	if location == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(location)
+	if err != nil {
+		return ""
+	}
+
+	path := strings.Trim(parsed.Path, "/")
+	if path == "" {
+		return ""
+	}
+
+	parts := strings.Split(path, "/")
+	return parts[len(parts)-1]
+}
+
+func rememberUploadOwner(uploadID string, ownerHash string) {
+	if db == nil || uploadID == "" || ownerHash == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO upload_owners(upload_id, owner_key_hash)
+		VALUES($1, $2)
+		ON CONFLICT (upload_id) DO UPDATE SET owner_key_hash = EXCLUDED.owner_key_hash
+	`, uploadID, ownerHash)
+	if err != nil {
+		log.Printf("Failed to remember upload owner for %s: %v", uploadID, err)
+	}
+}
+
+func ownerHashForUpload(ctx context.Context, uploadID string) string {
+	if db == nil || uploadID == "" {
+		return ""
+	}
+
+	var ownerHash string
+	err := db.QueryRowContext(ctx, "SELECT owner_key_hash FROM upload_owners WHERE upload_id=$1", uploadID).Scan(&ownerHash)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("Failed to resolve upload owner for %s: %v", uploadID, err)
+	}
+	return ownerHash
 }
 
 func listObjects(c *gin.Context) {

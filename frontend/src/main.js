@@ -22,7 +22,9 @@ axios.interceptors.request.use(config => {
   const apiKey = getApiKey()
   const adminKey = getAdminKey()
   
-  if (apiKey) {
+  if (config.url?.startsWith('/api/admin') && adminKey) {
+    config.headers['X-Admin-Key'] = adminKey
+  } else if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   } else if (adminKey) {
     config.headers['X-Admin-Key'] = adminKey

@@ -17,6 +17,10 @@
     <div v-if="file" class="file-status">
       <p>{{ file.name }} ({{ formatSize(file.size) }})</p>
       <el-progress :percentage="progress" />
+      <div class="speed-display" v-if="uploading || paused || uploaded">
+        <span>实时速度：{{ currentSpeedMbps }} Mbps</span>
+        <span>分片大小：{{ formatSize(UPLOAD_CHUNK_SIZE) }}</span>
+      </div>
 
       <div class="actions">
         <el-button type="primary" @click="startUpload" v-if="!uploading && !uploaded">
@@ -73,8 +77,13 @@ const uploadStats = ref(null)
 const uploadStartedAt = ref(null)
 const pausedAt = ref(null)
 const pausedDurationMs = ref(0)
+const currentSpeedMbps = ref('0.00')
+
+const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
+const SPEED_WINDOW_MS = 10 * 1000
 
 let upload = null
+let speedSamples = []
 
 const resetUploadState = () => {
   progress.value = 0
@@ -86,6 +95,8 @@ const resetUploadState = () => {
   uploadStartedAt.value = null
   pausedAt.value = null
   pausedDurationMs.value = 0
+  currentSpeedMbps.value = '0.00'
+  speedSamples = []
 }
 
 const handleFileChange = (uploadFile) => {
@@ -143,6 +154,31 @@ const buildHeaders = () => {
   return headers
 }
 
+const resetSpeedWindow = () => {
+  currentSpeedMbps.value = '0.00'
+  speedSamples = []
+}
+
+const updateRealtimeSpeed = (bytesUploaded) => {
+  const now = Date.now()
+  speedSamples.push({ time: now, bytes: bytesUploaded })
+  speedSamples = speedSamples.filter(sample => now - sample.time <= SPEED_WINDOW_MS)
+
+  if (speedSamples.length < 2) {
+    currentSpeedMbps.value = '0.00'
+    return
+  }
+
+  const first = speedSamples[0]
+  const last = speedSamples[speedSamples.length - 1]
+  const elapsedSeconds = (last.time - first.time) / 1000
+  const uploadedBytes = last.bytes - first.bytes
+
+  currentSpeedMbps.value = elapsedSeconds > 0 && uploadedBytes > 0
+    ? ((uploadedBytes * 8) / elapsedSeconds / 1000 / 1000).toFixed(2)
+    : '0.00'
+}
+
 const finishStats = () => {
   const finishedAt = new Date()
   const startedAt = uploadStartedAt.value || finishedAt
@@ -184,6 +220,7 @@ const startUpload = () => {
 
   upload = new tus.Upload(file.value, {
     endpoint: '/files/',
+    chunkSize: UPLOAD_CHUNK_SIZE,
     retryDelays: [0, 3000, 5000, 10000, 20000],
     headers,
     metadata: {
@@ -198,6 +235,7 @@ const startUpload = () => {
     onProgress: (bytesUploaded, bytesTotal) => {
       const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2)
       progress.value = Number(percentage)
+      updateRealtimeSpeed(bytesUploaded)
     },
     onSuccess: async () => {
       uploading.value = false
@@ -231,6 +269,7 @@ const pauseUpload = () => {
     uploading.value = false
     paused.value = true
     pausedAt.value = new Date()
+    resetSpeedWindow()
   }
 }
 
@@ -240,6 +279,7 @@ const resumeUpload = () => {
       pausedDurationMs.value += Date.now() - pausedAt.value.getTime()
       pausedAt.value = null
     }
+    resetSpeedWindow()
     upload.start()
     uploading.value = true
     paused.value = false
@@ -259,6 +299,15 @@ const resumeUpload = () => {
 
 .actions {
   margin-top: 15px;
+}
+
+.speed-display {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin-top: 10px;
+  color: #606266;
+  font-size: 13px;
 }
 
 .code-display {
