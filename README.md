@@ -71,6 +71,7 @@ docker-compose up -d --build
 - MinIO 控制台：`http://localhost:9001`
 
 默认 MinIO 账号密码见 `docker-compose.yml`，生产环境必须修改。
+MinIO 镜像已固定为 `minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1`，避免生产部署时使用浮动 `latest` 标签导致拉取结果不稳定。
 
 ## 生产部署
 
@@ -127,6 +128,13 @@ docker compose --env-file .env.production up -d --build
 - MinIO：`${DATA_ROOT:-/data}/minio`
 
 执行 `./deploy.sh` 时会自动创建上述目录；如果普通用户权限不足，脚本会尝试使用 `sudo mkdir -p` 创建。
+
+如果部署时遇到镜像层下载失败，可以先重试：
+
+```bash
+docker compose --env-file .env.production pull minio
+./deploy.sh
+```
 
 后端不再额外挂载 `/data/uploads` 作为大文件持久化目录。当前 S3/MinIO 模式下，大文件最终写入 MinIO。
 
