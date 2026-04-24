@@ -70,7 +70,7 @@ DATA_ROOT="${DATA_ROOT:-${ENV_FILE_DATA_ROOT:-/data}}"
 echo "Data root: $DATA_ROOT"
 
 if [[ -d "nginx" ]]; then
-  echo "Notice: Please make sure nginx domain, certificate, and key files are configured correctly before production deployment."
+  echo "Notice: HTTP-only gateway is enabled. Use it for testing only and switch back to HTTPS before production use."
 fi
 
 ensure_data_dirs() {

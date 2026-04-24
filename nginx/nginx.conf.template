@@ -25,21 +25,7 @@ http {
 
     server {
         listen       80;
-        server_name  ${NGINX_SERVER_NAME};
-        return 301 https://${NGINX_SERVER_NAME}$request_uri;
-    }
-
-    server {
-        listen       443 ssl;
-        server_name  ${NGINX_SERVER_NAME};
-
-        ssl_certificate      /etc/nginx/certs/${NGINX_SSL_CERTIFICATE};
-        ssl_certificate_key  /etc/nginx/certs/${NGINX_SSL_CERTIFICATE_KEY};
-        ssl_session_cache    shared:SSL:1m;
-        ssl_session_timeout  5m;
-
-        ssl_ciphers  HIGH:!aNULL:!MD5;
-        ssl_prefer_server_ciphers  on;
+        server_name  _;
 
         location / {
             proxy_pass http://frontend;
