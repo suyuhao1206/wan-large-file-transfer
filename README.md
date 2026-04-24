@@ -99,7 +99,7 @@ S3_REGION=us-east-1
 部署前确认：
 
 - 服务器已安装 Docker 和 Docker Compose。
-- 数据盘已挂载到 `DATA_ROOT`，默认 `/data`。
+- 数据盘已挂载到 `DATA_ROOT`，默认 `/data`。`deploy.sh` 会自动创建 `${DATA_ROOT}/postgres` 和 `${DATA_ROOT}/minio`。
 - Nginx 域名、证书、私钥已经放到 `nginx/` 目录并在 `nginx/nginx.conf` 中配置正确。
 - `.env.production` 已设置 `API_KEY` 和 `ADMIN_KEY`。
 
@@ -125,6 +125,8 @@ docker compose --env-file .env.production up -d --build
 
 - PostgreSQL：`${DATA_ROOT:-/data}/postgres`
 - MinIO：`${DATA_ROOT:-/data}/minio`
+
+执行 `./deploy.sh` 时会自动创建上述目录；如果普通用户权限不足，脚本会尝试使用 `sudo mkdir -p` 创建。
 
 后端不再额外挂载 `/data/uploads` 作为大文件持久化目录。当前 S3/MinIO 模式下，大文件最终写入 MinIO。
 

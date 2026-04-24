@@ -67,14 +67,31 @@ if [[ -d "nginx" ]]; then
   echo "Notice: Please make sure nginx domain, certificate, and key files are configured correctly before production deployment."
 fi
 
-if [[ ! -d "$DATA_ROOT" ]]; then
-  echo "Error: DATA_ROOT directory does not exist: $DATA_ROOT"
-  echo "Please mount your data disk first and create the directory, for example:"
-  echo "  sudo mkdir -p $DATA_ROOT/postgres $DATA_ROOT/minio"
-  exit 1
-fi
+ensure_data_dirs() {
+  local postgres_dir="$DATA_ROOT/postgres"
+  local minio_dir="$DATA_ROOT/minio"
 
-mkdir -p "$DATA_ROOT/postgres" "$DATA_ROOT/minio"
+  echo "Ensuring data directories exist:"
+  echo "  $postgres_dir"
+  echo "  $minio_dir"
+
+  if mkdir -p "$postgres_dir" "$minio_dir" 2>/dev/null; then
+    return
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    echo "Normal mkdir failed. Trying with sudo..."
+    sudo mkdir -p "$postgres_dir" "$minio_dir"
+    return
+  fi
+
+  echo "Error: failed to create data directories under $DATA_ROOT"
+  echo "Please create them manually, for example:"
+  echo "  sudo mkdir -p $postgres_dir $minio_dir"
+  exit 1
+}
+
+ensure_data_dirs
 
 echo "Stopping existing containers..."
 compose down
