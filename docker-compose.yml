@@ -1,12 +1,19 @@
 services:
   gateway:
     image: nginx:alpine
+    command: >
+      /bin/sh -c "envsubst '$$NGINX_SERVER_NAME $$NGINX_SSL_CERTIFICATE $$NGINX_SSL_CERTIFICATE_KEY $$BACKEND_PORT' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    environment:
+      - NGINX_SERVER_NAME=${NGINX_SERVER_NAME:?NGINX_SERVER_NAME is required}
+      - NGINX_SSL_CERTIFICATE=${NGINX_SSL_CERTIFICATE:?NGINX_SSL_CERTIFICATE is required}
+      - NGINX_SSL_CERTIFICATE_KEY=${NGINX_SSL_CERTIFICATE_KEY:?NGINX_SSL_CERTIFICATE_KEY is required}
+      - BACKEND_PORT=${BACKEND_PORT:-8080}
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
       - ./nginx:/etc/nginx/certs:ro
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
     depends_on:
       - frontend
       - backend
@@ -29,26 +36,26 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     expose:
-      - "8080"
+      - "${BACKEND_PORT:-8080}"
     environment:
-      - DB_HOST=postgres
-      - DB_USER=filecodebox
-      - DB_PASSWORD=filecodebox
-      - DB_NAME=filecodebox
-      - S3_ENDPOINT=http://minio:9000
-      - S3_PUBLIC_ENDPOINT=http://8.145.57.148:9000
-      - S3_BUCKET=uploads
-      - S3_ACCESS_KEY=minioadmin
-      - S3_SECRET_KEY=minioadmin
-      - S3_REGION=us-east-1
-      - TUSD_UPLOAD_DIR=/data/uploads
-      - SHARE_CODE_TTL_MINUTES=120
-      - SHARE_CODE_MAX_DOWNLOADS=10000
-      - CORS_ORIGINS=*
-      - ENABLE_DEBUG_ENDPOINTS=false
-      - PORT=8080
-      - API_KEY=${API_KEY:-}
-      - ADMIN_KEY=${ADMIN_KEY:-}
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_USER=${POSTGRES_USER:?POSTGRES_USER is required}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - DB_NAME=${POSTGRES_DB:?POSTGRES_DB is required}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_PUBLIC_ENDPOINT=${S3_PUBLIC_ENDPOINT:?S3_PUBLIC_ENDPOINT is required}
+      - S3_BUCKET=${S3_BUCKET:-uploads}
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - TUSD_UPLOAD_DIR=${TUSD_UPLOAD_DIR:-/data/uploads}
+      - SHARE_CODE_TTL_MINUTES=${SHARE_CODE_TTL_MINUTES:-120}
+      - SHARE_CODE_MAX_DOWNLOADS=${SHARE_CODE_MAX_DOWNLOADS:-10000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - ENABLE_DEBUG_ENDPOINTS=${ENABLE_DEBUG_ENDPOINTS:-false}
+      - PORT=${BACKEND_PORT:-8080}
+      - API_KEY=${API_KEY:?API_KEY is required}
+      - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY is required}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,13 +67,13 @@ services:
   postgres:
     image: postgres:14-alpine
     environment:
-      - POSTGRES_USER=filecodebox
-      - POSTGRES_PASSWORD=filecodebox
-      - POSTGRES_DB=filecodebox
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER is required}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_DB=${POSTGRES_DB:?POSTGRES_DB is required}
     volumes:
       - ${DATA_ROOT:-/data}/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U filecodebox"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -77,11 +84,11 @@ services:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
     volumes:
       - ${DATA_ROOT:-/data}/minio:/data
     healthcheck:

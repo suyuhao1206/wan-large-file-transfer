@@ -39,8 +39,14 @@ COMPOSE_ENV_FILE=""
 if [[ -f "$ENV_FILE" ]]; then
   COMPOSE_ENV_FILE="$ENV_FILE"
   echo "Using compose env file: $COMPOSE_ENV_FILE"
+elif [[ -f ".env.example" ]]; then
+  cp ".env.example" "$ENV_FILE"
+  echo "Created $ENV_FILE from .env.example."
+  echo "Please edit $ENV_FILE and replace all change-me values before running ./deploy.sh again."
+  exit 1
 else
-  echo "Notice: $ENV_FILE not found. Compose will use shell environment variables and defaults."
+  echo "Error: $ENV_FILE not found, and .env.example is also missing."
+  exit 1
 fi
 
 compose() {
