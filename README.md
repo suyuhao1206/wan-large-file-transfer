@@ -103,7 +103,7 @@ POSTGRES_PASSWORD=change-me-db-password
 POSTGRES_DB=filecodebox
 
 S3_ENDPOINT=http://minio:9000
-S3_PUBLIC_ENDPOINT=http://your-domain.com:9000
+S3_PUBLIC_ENDPOINT=https://your-domain.com
 S3_BUCKET=uploads
 MINIO_ROOT_USER=change-me-minio-user
 MINIO_ROOT_PASSWORD=change-me-minio-password

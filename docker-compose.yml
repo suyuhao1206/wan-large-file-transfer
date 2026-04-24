@@ -2,12 +2,13 @@ services:
   gateway:
     image: nginx:alpine
     command: >
-      /bin/sh -c "envsubst '$$NGINX_SERVER_NAME $$NGINX_SSL_CERTIFICATE $$NGINX_SSL_CERTIFICATE_KEY $$BACKEND_PORT' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+      /bin/sh -c "envsubst '$$NGINX_SERVER_NAME $$NGINX_SSL_CERTIFICATE $$NGINX_SSL_CERTIFICATE_KEY $$BACKEND_PORT $$S3_BUCKET' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     environment:
       - NGINX_SERVER_NAME=${NGINX_SERVER_NAME:?NGINX_SERVER_NAME is required}
       - NGINX_SSL_CERTIFICATE=${NGINX_SSL_CERTIFICATE:?NGINX_SSL_CERTIFICATE is required}
       - NGINX_SSL_CERTIFICATE_KEY=${NGINX_SSL_CERTIFICATE_KEY:?NGINX_SSL_CERTIFICATE_KEY is required}
       - BACKEND_PORT=${BACKEND_PORT:-8080}
+      - S3_BUCKET=${S3_BUCKET:-uploads}
     volumes:
       - ./nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
       - ./nginx:/etc/nginx/certs:ro
