@@ -35,6 +35,7 @@ import (
 // Global Storage
 var (
     codeToUpload = make(map[string]UploadRecord)
+    s3KeyCache   = make(map[string]string)
     mu           sync.RWMutex
     
     // Global components
@@ -264,6 +265,16 @@ func main() {
 				}
 			}
 
+			if s3Client != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if key, err := resolveS3ObjectKey(ctx, uploadID); err == nil {
+					log.Printf("Cached S3 key for upload %s: %s", uploadID, key)
+				} else {
+					log.Printf("Failed to cache S3 key for upload %s: %v", uploadID, err)
+				}
+				cancel()
+			}
+
             log.Printf("Event: Upload completed - ID: %s, Filename: %s", uploadID, filename)
         }
     }()
@@ -400,46 +411,13 @@ func main() {
 
 			// S3 Download (Redirect to Presigned URL)
 			if s3Client != nil {
-				targetKey := uploadID
-				
-				// 1. Check if object exists (Fast Path)
-				_, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
-					Bucket: aws.String(s3Bucket),
-					Key:    aws.String(targetKey),
-				})
-				
-				// 2. If not found, try to find it via Prefix Search (Robust Path)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				targetKey, err := resolveS3ObjectKey(ctx, uploadID)
+				cancel()
 				if err != nil {
-					log.Printf("Key %s not found directly, trying prefix search...", targetKey)
-					
-					// Robust Prefix Strategy:
-					// Tusd IDs often start with a 32-char UUID. Use the first 32 chars as prefix.
-					// If ID is shorter than 32, use the whole ID.
-					prefix := targetKey
-					if len(targetKey) > 32 {
-						prefix = targetKey[:32]
-					}
-					
-					// List objects with prefix
-					listOut, lerr := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
-						Bucket: aws.String(s3Bucket),
-						Prefix: aws.String(prefix),
-						MaxKeys: 10,
-					})
-					
-					if lerr == nil {
-						for _, obj := range listOut.Contents {
-							k := *obj.Key
-							// Skip .info files
-							if strings.HasSuffix(k, ".info") {
-								continue
-							}
-							// Found a candidate (the data file)
-							targetKey = k
-							log.Printf("Resolved S3 Key: %s -> %s", uploadID, targetKey)
-							break
-						}
-					}
+					log.Printf("Failed to resolve S3 key for %s: %v", uploadID, err)
+					c.JSON(404, gin.H{"error": "File not found"})
+					return
 				}
 
 				presignReq, err := s3PresignClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
@@ -677,6 +655,61 @@ func verifyAPIKey(key string) (bool, error) {
 		keyHash)
 
 	return true, nil
+}
+
+func resolveS3ObjectKey(ctx context.Context, uploadID string) (string, error) {
+	mu.RLock()
+	if cachedKey, exists := s3KeyCache[uploadID]; exists && cachedKey != "" {
+		mu.RUnlock()
+		return cachedKey, nil
+	}
+	mu.RUnlock()
+
+	_, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s3Bucket),
+		Key:    aws.String(uploadID),
+	})
+	if err == nil {
+		cacheS3ObjectKey(uploadID, uploadID)
+		return uploadID, nil
+	}
+
+	log.Printf("Key %s not found directly, trying prefix search...", uploadID)
+
+	prefix := uploadID
+	if len(prefix) > 32 {
+		prefix = prefix[:32]
+	}
+
+	listOut, lerr := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(s3Bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: 10,
+	})
+	if lerr != nil {
+		return "", lerr
+	}
+
+	for _, obj := range listOut.Contents {
+		if obj.Key == nil {
+			continue
+		}
+		key := *obj.Key
+		if strings.HasSuffix(key, ".info") {
+			continue
+		}
+		cacheS3ObjectKey(uploadID, key)
+		log.Printf("Resolved S3 key: %s -> %s", uploadID, key)
+		return key, nil
+	}
+
+	return "", fmt.Errorf("object not found for upload %s", uploadID)
+}
+
+func cacheS3ObjectKey(uploadID string, key string) {
+	mu.Lock()
+	s3KeyCache[uploadID] = key
+	mu.Unlock()
 }
 
 // API Key authentication middleware
