@@ -54,7 +54,7 @@ services:
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
       - ENABLE_DEBUG_ENDPOINTS=${ENABLE_DEBUG_ENDPOINTS:-false}
       - PORT=${BACKEND_PORT:-8080}
-      - API_KEY=${API_KEY:?API_KEY is required}
+      - API_KEY=${API_KEY:-}
       - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY is required}
     depends_on:
       postgres:
