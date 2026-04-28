@@ -34,14 +34,6 @@
             <span class="metric-label">平均利用率</span>
             <strong>{{ averageBandwidthUtilization }}%</strong>
           </div>
-          <div class="metric-item">
-            <span class="metric-label">峰值速度</span>
-            <strong>{{ peakSpeedMbps }} Mbps</strong>
-          </div>
-          <div class="metric-item">
-            <span class="metric-label">峰值利用率</span>
-            <strong>{{ peakBandwidthUtilization }}%</strong>
-          </div>
         </div>
 
         <div class="speed-chart" v-if="speedChartPolyline">
@@ -91,8 +83,6 @@
             <p>确认传输量：{{ formatSize(uploadStats.confirmedBytes) }}</p>
             <p>平均确认速度：{{ uploadStats.averageSpeedMbps }} Mbps</p>
             <p>有效带宽利用率：{{ uploadStats.averageBandwidthUtilization }}%</p>
-            <p>峰值确认速度：{{ uploadStats.peakSpeedMbps }} Mbps</p>
-            <p>峰值带宽利用率：{{ uploadStats.peakBandwidthUtilization }}%</p>
           </div>
         </template>
       </el-result>
@@ -120,8 +110,6 @@ const currentSpeedMbps = ref('0.00')
 const currentBandwidthUtilization = ref('0.0')
 const averageConfirmedSpeedMbps = ref('0.00')
 const averageBandwidthUtilization = ref('0.0')
-const peakSpeedMbps = ref('0.00')
-const peakBandwidthUtilization = ref('0.0')
 const speedHistory = ref([])
 
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
@@ -237,8 +225,6 @@ const resetTransferMetrics = () => {
   currentBandwidthUtilization.value = '0.0'
   averageConfirmedSpeedMbps.value = '0.00'
   averageBandwidthUtilization.value = '0.0'
-  peakSpeedMbps.value = '0.00'
-  peakBandwidthUtilization.value = '0.0'
   speedHistory.value = []
   speedSamples = []
   realtimeBytesUploaded = 0
@@ -319,11 +305,6 @@ const updateRealtimeSpeed = (bytesUploaded) => {
   currentSpeedMbps.value = formatSpeedMbps(speedMbps)
   currentBandwidthUtilization.value = formatUtilization(speedMbps)
 
-  if (speedMbps > Number(peakSpeedMbps.value)) {
-    peakSpeedMbps.value = formatSpeedMbps(speedMbps)
-    peakBandwidthUtilization.value = formatUtilization(speedMbps)
-  }
-
   speedHistory.value = [
     ...speedHistory.value,
     { time: now, mbps: speedMbps }
@@ -358,9 +339,7 @@ const finishStats = () => {
     durationText: formatDuration(durationMs),
     confirmedBytes: statsBytes,
     averageSpeedMbps: formatSpeedMbps(averageSpeedMbps),
-    averageBandwidthUtilization: formatUtilization(averageSpeedMbps),
-    peakSpeedMbps: peakSpeedMbps.value,
-    peakBandwidthUtilization: peakBandwidthUtilization.value
+    averageBandwidthUtilization: formatUtilization(averageSpeedMbps)
   }
 }
 
@@ -374,22 +353,15 @@ const applyServerUploadMetric = (metric) => {
   }
 
   const averageSpeed = (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
-  const peakSpeed = Number(metric.peak_mbps)
   averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
   averageBandwidthUtilization.value = formatUtilization(averageSpeed)
-  if (Number.isFinite(peakSpeed) && peakSpeed > 0) {
-    peakSpeedMbps.value = formatSpeedMbps(peakSpeed)
-    peakBandwidthUtilization.value = formatUtilization(peakSpeed)
-  }
 
   uploadStats.value = {
     ...uploadStats.value,
     durationText: formatDuration(durationMs),
     confirmedBytes,
     averageSpeedMbps: formatSpeedMbps(averageSpeed),
-    averageBandwidthUtilization: formatUtilization(averageSpeed),
-    peakSpeedMbps: Number.isFinite(peakSpeed) && peakSpeed > 0 ? formatSpeedMbps(peakSpeed) : uploadStats.value.peakSpeedMbps,
-    peakBandwidthUtilization: Number.isFinite(peakSpeed) && peakSpeed > 0 ? formatUtilization(peakSpeed) : uploadStats.value.peakBandwidthUtilization
+    averageBandwidthUtilization: formatUtilization(averageSpeed)
   }
 }
 
@@ -562,7 +534,7 @@ const stopUpload = async () => {
 
 .metric-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   text-align: left;
   border-top: 1px solid #ebeef5;
   border-bottom: 1px solid #ebeef5;

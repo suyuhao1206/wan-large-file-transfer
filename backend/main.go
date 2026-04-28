@@ -64,7 +64,6 @@ type UploadRecord struct {
 type UploadMetric struct {
 	Bytes    int64
 	Duration time.Duration
-	PeakMbps float64
 }
 
 func main() {
@@ -1461,10 +1460,6 @@ func recordUploadMetric(uploadID string, bytes int64, duration time.Duration) {
 	metric := uploadMetrics[uploadID]
 	metric.Bytes += bytes
 	metric.Duration += duration
-	speedMbps := float64(bytes*8) / duration.Seconds() / 1000 / 1000
-	if speedMbps > metric.PeakMbps {
-		metric.PeakMbps = speedMbps
-	}
 	uploadMetrics[uploadID] = metric
 	metricsMu.Unlock()
 }
@@ -1503,7 +1498,6 @@ func shareCodeResponse(uploadID string, code string, filename string) gin.H {
 			"bytes":        metric.Bytes,
 			"duration_ms":  float64(metric.Duration) / float64(time.Millisecond),
 			"average_mbps": float64(metric.Bytes*8) / metric.Duration.Seconds() / 1000 / 1000,
-			"peak_mbps":    metric.PeakMbps,
 		}
 	}
 
