@@ -64,6 +64,7 @@ type UploadRecord struct {
 type UploadMetric struct {
 	Bytes    int64
 	Duration time.Duration
+	PeakMbps float64
 }
 
 func main() {
@@ -211,9 +212,10 @@ func main() {
 
 	// Create tusd handler
 	tusConfig := handler.Config{
-		BasePath:              "/files/",
-		StoreComposer:         composer,
-		NotifyCompleteUploads: true,
+		BasePath:                "/files/",
+		StoreComposer:           composer,
+		NotifyCompleteUploads:   true,
+		NotifyTerminatedUploads: true,
 	}
 
 	tusHandler, err := handler.NewHandler(tusConfig)
@@ -285,6 +287,15 @@ func main() {
             log.Printf("Event: Upload completed - ID: %s, Filename: %s", uploadID, filename)
         }
     }()
+
+	go func() {
+		for {
+			event := <-tusHandler.TerminatedUploads
+			uploadID := event.Upload.ID
+			clearUploadRuntimeState(uploadID)
+			log.Printf("Event: Upload terminated - ID: %s", uploadID)
+		}
+	}()
 
     // Start Gin Server
     gin.SetMode(gin.ReleaseMode)
@@ -476,6 +487,10 @@ func main() {
 				acceptedBytes = c.Request.ContentLength
 			}
 			recordUploadMetric(uploadID, acceptedBytes, time.Since(metricStartedAt))
+		}
+
+		if c.Request.Method == http.MethodDelete && uploadID != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
+			clearUploadRuntimeState(uploadID)
 		}
 
 		if c.Request.Method == http.MethodPost && ownerHash != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
@@ -1446,8 +1461,27 @@ func recordUploadMetric(uploadID string, bytes int64, duration time.Duration) {
 	metric := uploadMetrics[uploadID]
 	metric.Bytes += bytes
 	metric.Duration += duration
+	speedMbps := float64(bytes*8) / duration.Seconds() / 1000 / 1000
+	if speedMbps > metric.PeakMbps {
+		metric.PeakMbps = speedMbps
+	}
 	uploadMetrics[uploadID] = metric
 	metricsMu.Unlock()
+}
+
+func clearUploadRuntimeState(uploadID string) {
+	if uploadID == "" {
+		return
+	}
+
+	metricsMu.Lock()
+	delete(uploadMetrics, uploadID)
+	metricsMu.Unlock()
+
+	mu.Lock()
+	delete(codeToUpload, uploadID)
+	delete(s3KeyCache, uploadID)
+	mu.Unlock()
 }
 
 func getUploadMetric(uploadID string) (UploadMetric, bool) {
@@ -1469,6 +1503,7 @@ func shareCodeResponse(uploadID string, code string, filename string) gin.H {
 			"bytes":        metric.Bytes,
 			"duration_ms":  float64(metric.Duration) / float64(time.Millisecond),
 			"average_mbps": float64(metric.Bytes*8) / metric.Duration.Seconds() / 1000 / 1000,
+			"peak_mbps":    metric.PeakMbps,
 		}
 	}
 

@@ -18,7 +18,7 @@
       <p>{{ file.name }} ({{ formatSize(file.size) }})</p>
       <el-progress :percentage="progress" />
       <div class="speed-display" v-if="uploading || paused || uploaded">
-        <span>确认速度：{{ currentSpeedMbps }} Mbps</span>
+        <span>实时速度：{{ currentSpeedMbps }} Mbps</span>
         <span>固定带宽：{{ FIXED_BANDWIDTH_MBPS }} Mbps</span>
         <span>当前利用率：{{ currentBandwidthUtilization }}%</span>
         <span>分片大小：{{ formatSize(UPLOAD_CHUNK_SIZE) }}</span>
@@ -46,10 +46,10 @@
 
         <div class="speed-chart" v-if="speedChartPolyline">
           <div class="chart-header">
-            <span>确认速度曲线</span>
+            <span>实时速度曲线</span>
             <span>上传全程</span>
           </div>
-          <svg viewBox="0 0 600 120" role="img" aria-label="上传全程确认速度曲线">
+          <svg viewBox="0 0 600 120" role="img" aria-label="上传全程实时速度曲线">
             <line x1="0" y1="119" x2="600" y2="119" class="chart-axis" />
             <polyline :points="speedChartPolyline" class="chart-line" />
           </svg>
@@ -57,7 +57,7 @@
       </div>
 
       <div class="actions">
-        <el-button type="primary" @click="startUpload" v-if="!uploading && !uploaded">
+        <el-button type="primary" @click="startUpload" v-if="!uploading && !paused && !uploaded">
           开始上传
         </el-button>
         <el-button type="warning" @click="pauseUpload" v-if="uploading">
@@ -65,6 +65,9 @@
         </el-button>
         <el-button type="primary" @click="resumeUpload" v-if="paused">
           继续
+        </el-button>
+        <el-button type="danger" @click="stopUpload" v-if="paused">
+          停止上传
         </el-button>
       </div>
     </div>
@@ -129,6 +132,7 @@ const FIXED_BANDWIDTH_MBPS = 100
 
 let upload = null
 let speedSamples = []
+let realtimeBytesUploaded = 0
 let confirmedBytesUploaded = 0
 let activeUploadStartedAtMs = null
 let activeUploadDurationMs = 0
@@ -237,6 +241,7 @@ const resetTransferMetrics = () => {
   peakBandwidthUtilization.value = '0.0'
   speedHistory.value = []
   speedSamples = []
+  realtimeBytesUploaded = 0
   confirmedBytesUploaded = 0
   activeUploadStartedAtMs = null
   activeUploadDurationMs = 0
@@ -245,7 +250,7 @@ const resetTransferMetrics = () => {
 const resetSpeedWindow = (now = performance.now()) => {
   currentSpeedMbps.value = '0.00'
   currentBandwidthUtilization.value = '0.0'
-  speedSamples = [{ time: now, bytes: confirmedBytesUploaded }]
+  speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
   speedHistory.value = [
     ...speedHistory.value,
     { time: now, mbps: 0 }
@@ -281,20 +286,20 @@ const getActiveUploadDurationMs = () => {
 
 const updateAverageMetrics = () => {
   const durationMs = getActiveUploadDurationMs()
-  const averageSpeed = durationMs > 0 && confirmedBytesUploaded > 0
-    ? (confirmedBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
+  const averageSpeed = durationMs > 0 && realtimeBytesUploaded > 0
+    ? (realtimeBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
     : 0
 
   averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
   averageBandwidthUtilization.value = formatUtilization(averageSpeed)
 }
 
-const updateConfirmedSpeed = (chunkSize) => {
-  if (!chunkSize || chunkSize <= 0) return
+const updateRealtimeSpeed = (bytesUploaded) => {
+  if (!Number.isFinite(bytesUploaded) || bytesUploaded < 0) return
 
   const now = performance.now()
-  confirmedBytesUploaded += chunkSize
-  speedSamples.push({ time: now, bytes: confirmedBytesUploaded })
+  realtimeBytesUploaded = bytesUploaded
+  speedSamples.push({ time: now, bytes: realtimeBytesUploaded })
   speedSamples = speedSamples.filter(sample => now - sample.time <= SPEED_WINDOW_MS)
 
   if (speedSamples.length < 2) {
@@ -305,10 +310,10 @@ const updateConfirmedSpeed = (chunkSize) => {
   const first = speedSamples[0]
   const last = speedSamples[speedSamples.length - 1]
   const elapsedSeconds = (last.time - first.time) / 1000
-  const confirmedBytes = last.bytes - first.bytes
+  const realtimeBytes = last.bytes - first.bytes
 
-  const speedMbps = elapsedSeconds > 0 && confirmedBytes > 0
-    ? (confirmedBytes * 8) / elapsedSeconds / 1000 / 1000
+  const speedMbps = elapsedSeconds > 0 && realtimeBytes > 0
+    ? (realtimeBytes * 8) / elapsedSeconds / 1000 / 1000
     : 0
 
   currentSpeedMbps.value = formatSpeedMbps(speedMbps)
@@ -326,6 +331,12 @@ const updateConfirmedSpeed = (chunkSize) => {
   updateAverageMetrics()
 }
 
+const updateConfirmedSpeed = (chunkSize) => {
+  if (!chunkSize || chunkSize <= 0) return
+
+  confirmedBytesUploaded += chunkSize
+}
+
 const finishStats = () => {
   stopActiveUploadTiming()
 
@@ -333,8 +344,9 @@ const finishStats = () => {
   const startedAt = uploadStartedAt.value || finishedAt
   const durationMs = Math.max(0, getActiveUploadDurationMs())
 
-  const averageSpeedMbps = durationMs > 0 && confirmedBytesUploaded > 0
-    ? (confirmedBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
+  const statsBytes = confirmedBytesUploaded > 0 ? confirmedBytesUploaded : realtimeBytesUploaded
+  const averageSpeedMbps = durationMs > 0 && statsBytes > 0
+    ? (statsBytes * 8) / (durationMs / 1000) / 1000 / 1000
     : 0
 
   averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeedMbps)
@@ -344,7 +356,7 @@ const finishStats = () => {
     startedAt,
     finishedAt,
     durationText: formatDuration(durationMs),
-    confirmedBytes: confirmedBytesUploaded,
+    confirmedBytes: statsBytes,
     averageSpeedMbps: formatSpeedMbps(averageSpeedMbps),
     averageBandwidthUtilization: formatUtilization(averageSpeedMbps),
     peakSpeedMbps: peakSpeedMbps.value,
@@ -362,22 +374,51 @@ const applyServerUploadMetric = (metric) => {
   }
 
   const averageSpeed = (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
+  const peakSpeed = Number(metric.peak_mbps)
   averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
   averageBandwidthUtilization.value = formatUtilization(averageSpeed)
+  if (Number.isFinite(peakSpeed) && peakSpeed > 0) {
+    peakSpeedMbps.value = formatSpeedMbps(peakSpeed)
+    peakBandwidthUtilization.value = formatUtilization(peakSpeed)
+  }
 
   uploadStats.value = {
     ...uploadStats.value,
     durationText: formatDuration(durationMs),
     confirmedBytes,
     averageSpeedMbps: formatSpeedMbps(averageSpeed),
-    averageBandwidthUtilization: formatUtilization(averageSpeed)
+    averageBandwidthUtilization: formatUtilization(averageSpeed),
+    peakSpeedMbps: Number.isFinite(peakSpeed) && peakSpeed > 0 ? formatSpeedMbps(peakSpeed) : uploadStats.value.peakSpeedMbps,
+    peakBandwidthUtilization: Number.isFinite(peakSpeed) && peakSpeed > 0 ? formatUtilization(peakSpeed) : uploadStats.value.peakBandwidthUtilization
   }
+}
+
+const uploadIdFromUrl = (url) => {
+  if (!url) return ''
+
+  try {
+    const parsed = new URL(url, window.location.origin)
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    return parts[parts.length - 1] || ''
+  } catch {
+    const cleanUrl = url.split('?')[0]
+    return cleanUrl.substring(cleanUrl.lastIndexOf('/') + 1)
+  }
+}
+
+const terminateUploadOnServer = async (uploadId) => {
+  if (!uploadId) return
+
+  await axios.delete(`/files/${encodeURIComponent(uploadId)}`, {
+    headers: buildHeaders()
+  })
 }
 
 const startUpload = () => {
   if (!file.value) return
 
   uploading.value = true
+  paused.value = false
   uploaded.value = false
   uploadStats.value = null
   uploadStartedAt.value = null
@@ -403,6 +444,7 @@ const startUpload = () => {
     onProgress: (bytesUploaded, bytesTotal) => {
       const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2)
       progress.value = Number(percentage)
+      updateRealtimeSpeed(bytesUploaded)
     },
     onChunkComplete: (chunkSize) => {
       updateConfirmedSpeed(chunkSize)
@@ -451,6 +493,40 @@ const resumeUpload = () => {
     upload.start()
     uploading.value = true
     paused.value = false
+  }
+}
+
+const stopUpload = async () => {
+  if (!upload) {
+    resetUploadState()
+    return
+  }
+
+  const uploadId = uploadIdFromUrl(upload.url)
+  stopActiveUploadTiming()
+
+  try {
+    try {
+      if (upload.url) {
+        await upload.abort(true)
+      } else {
+        await upload.abort()
+      }
+    } catch (err) {
+      if (uploadId) {
+        await terminateUploadOnServer(uploadId)
+      } else {
+        throw err
+      }
+    }
+
+    upload = null
+    resetUploadState()
+    ElMessage.success('已停止上传')
+  } catch (err) {
+    uploading.value = false
+    paused.value = true
+    ElMessage.error('停止上传失败: ' + (err.response?.data?.error || err.message))
   }
 }
 </script>
