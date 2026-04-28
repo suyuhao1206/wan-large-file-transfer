@@ -18,8 +18,42 @@
       <p>{{ file.name }} ({{ formatSize(file.size) }})</p>
       <el-progress :percentage="progress" />
       <div class="speed-display" v-if="uploading || paused || uploaded">
-        <span>实时速度：{{ currentSpeedMbps }} Mbps</span>
+        <span>确认速度：{{ currentSpeedMbps }} Mbps</span>
+        <span>固定带宽：{{ FIXED_BANDWIDTH_MBPS }} Mbps</span>
+        <span>当前利用率：{{ currentBandwidthUtilization }}%</span>
         <span>分片大小：{{ formatSize(UPLOAD_CHUNK_SIZE) }}</span>
+      </div>
+
+      <div class="bandwidth-panel" v-if="uploading || paused || uploaded">
+        <div class="metric-strip">
+          <div class="metric-item">
+            <span class="metric-label">平均速度</span>
+            <strong>{{ averageConfirmedSpeedMbps }} Mbps</strong>
+          </div>
+          <div class="metric-item">
+            <span class="metric-label">平均利用率</span>
+            <strong>{{ averageBandwidthUtilization }}%</strong>
+          </div>
+          <div class="metric-item">
+            <span class="metric-label">峰值速度</span>
+            <strong>{{ peakSpeedMbps }} Mbps</strong>
+          </div>
+          <div class="metric-item">
+            <span class="metric-label">峰值利用率</span>
+            <strong>{{ peakBandwidthUtilization }}%</strong>
+          </div>
+        </div>
+
+        <div class="speed-chart" v-if="speedChartPolyline">
+          <div class="chart-header">
+            <span>确认速度曲线</span>
+            <span>上传全程</span>
+          </div>
+          <svg viewBox="0 0 600 120" role="img" aria-label="上传全程确认速度曲线">
+            <line x1="0" y1="119" x2="600" y2="119" class="chart-axis" />
+            <polyline :points="speedChartPolyline" class="chart-line" />
+          </svg>
+        </div>
       </div>
 
       <div class="actions">
@@ -51,7 +85,11 @@
             <p>开始时间：{{ formatDateTime(uploadStats.startedAt) }}</p>
             <p>结束时间：{{ formatDateTime(uploadStats.finishedAt) }}</p>
             <p>上传耗时：{{ uploadStats.durationText }}</p>
-            <p>平均速度：{{ uploadStats.averageSpeedMbps }} Mbps</p>
+            <p>确认传输量：{{ formatSize(uploadStats.confirmedBytes) }}</p>
+            <p>平均确认速度：{{ uploadStats.averageSpeedMbps }} Mbps</p>
+            <p>有效带宽利用率：{{ uploadStats.averageBandwidthUtilization }}%</p>
+            <p>峰值确认速度：{{ uploadStats.peakSpeedMbps }} Mbps</p>
+            <p>峰值带宽利用率：{{ uploadStats.peakBandwidthUtilization }}%</p>
           </div>
         </template>
       </el-result>
@@ -60,7 +98,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import * as tus from 'tus-js-client'
 import axios from 'axios'
 import { UploadFilled } from '@element-plus/icons-vue'
@@ -75,15 +113,45 @@ const uploaded = ref(false)
 const shareCode = ref('')
 const uploadStats = ref(null)
 const uploadStartedAt = ref(null)
-const pausedAt = ref(null)
-const pausedDurationMs = ref(0)
 const currentSpeedMbps = ref('0.00')
+const currentBandwidthUtilization = ref('0.0')
+const averageConfirmedSpeedMbps = ref('0.00')
+const averageBandwidthUtilization = ref('0.0')
+const peakSpeedMbps = ref('0.00')
+const peakBandwidthUtilization = ref('0.0')
+const speedHistory = ref([])
 
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
 const SPEED_WINDOW_MS = 10 * 1000
+const SPEED_CHART_WIDTH = 600
+const SPEED_CHART_HEIGHT = 120
+const FIXED_BANDWIDTH_MBPS = 100
 
 let upload = null
 let speedSamples = []
+let confirmedBytesUploaded = 0
+let activeUploadStartedAtMs = null
+let activeUploadDurationMs = 0
+
+const speedChartPolyline = computed(() => {
+  if (speedHistory.value.length < 2) return ''
+
+  const latest = speedHistory.value[speedHistory.value.length - 1].time
+  const started = speedHistory.value[0].time
+  const duration = Math.max(1, latest - started)
+  const maxSpeed = Math.max(
+    FIXED_BANDWIDTH_MBPS,
+    ...speedHistory.value.map(sample => sample.mbps)
+  )
+
+  return speedHistory.value
+    .map((sample) => {
+      const x = ((sample.time - started) / duration) * SPEED_CHART_WIDTH
+      const y = SPEED_CHART_HEIGHT - Math.min(sample.mbps / maxSpeed, 1) * (SPEED_CHART_HEIGHT - 2) - 1
+      return `${Math.max(0, Math.min(SPEED_CHART_WIDTH, x)).toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+})
 
 const resetUploadState = () => {
   progress.value = 0
@@ -93,10 +161,7 @@ const resetUploadState = () => {
   shareCode.value = ''
   uploadStats.value = null
   uploadStartedAt.value = null
-  pausedAt.value = null
-  pausedDurationMs.value = 0
-  currentSpeedMbps.value = '0.00'
-  speedSamples = []
+  resetTransferMetrics()
 }
 
 const handleFileChange = (uploadFile) => {
@@ -140,6 +205,15 @@ const formatDuration = (durationMs) => {
   return parts.join(' ')
 }
 
+const formatSpeedMbps = (value) => {
+  return Number.isFinite(value) && value > 0 ? value.toFixed(2) : '0.00'
+}
+
+const formatUtilization = (speedMbps) => {
+  const utilization = (speedMbps / FIXED_BANDWIDTH_MBPS) * 100
+  return Number.isFinite(utilization) && utilization > 0 ? utilization.toFixed(1) : '0.0'
+}
+
 const buildHeaders = () => {
   const apiKey = getApiKey()
   const adminKey = getAdminKey()
@@ -154,14 +228,73 @@ const buildHeaders = () => {
   return headers
 }
 
-const resetSpeedWindow = () => {
+const resetTransferMetrics = () => {
   currentSpeedMbps.value = '0.00'
+  currentBandwidthUtilization.value = '0.0'
+  averageConfirmedSpeedMbps.value = '0.00'
+  averageBandwidthUtilization.value = '0.0'
+  peakSpeedMbps.value = '0.00'
+  peakBandwidthUtilization.value = '0.0'
+  speedHistory.value = []
   speedSamples = []
+  confirmedBytesUploaded = 0
+  activeUploadStartedAtMs = null
+  activeUploadDurationMs = 0
 }
 
-const updateRealtimeSpeed = (bytesUploaded) => {
-  const now = Date.now()
-  speedSamples.push({ time: now, bytes: bytesUploaded })
+const resetSpeedWindow = (now = performance.now()) => {
+  currentSpeedMbps.value = '0.00'
+  currentBandwidthUtilization.value = '0.0'
+  speedSamples = [{ time: now, bytes: confirmedBytesUploaded }]
+  speedHistory.value = [
+    ...speedHistory.value,
+    { time: now, mbps: 0 }
+  ]
+}
+
+const beginActiveUploadTiming = () => {
+  const now = performance.now()
+
+  if (!uploadStartedAt.value) {
+    uploadStartedAt.value = new Date()
+  }
+
+  if (activeUploadStartedAtMs === null) {
+    activeUploadStartedAtMs = now
+  }
+
+  resetSpeedWindow(now)
+}
+
+const stopActiveUploadTiming = () => {
+  if (activeUploadStartedAtMs === null) return
+
+  activeUploadDurationMs += performance.now() - activeUploadStartedAtMs
+  activeUploadStartedAtMs = null
+}
+
+const getActiveUploadDurationMs = () => {
+  if (activeUploadStartedAtMs === null) return activeUploadDurationMs
+
+  return activeUploadDurationMs + performance.now() - activeUploadStartedAtMs
+}
+
+const updateAverageMetrics = () => {
+  const durationMs = getActiveUploadDurationMs()
+  const averageSpeed = durationMs > 0 && confirmedBytesUploaded > 0
+    ? (confirmedBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
+    : 0
+
+  averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
+  averageBandwidthUtilization.value = formatUtilization(averageSpeed)
+}
+
+const updateConfirmedSpeed = (chunkSize) => {
+  if (!chunkSize || chunkSize <= 0) return
+
+  const now = performance.now()
+  confirmedBytesUploaded += chunkSize
+  speedSamples.push({ time: now, bytes: confirmedBytesUploaded })
   speedSamples = speedSamples.filter(sample => now - sample.time <= SPEED_WINDOW_MS)
 
   if (speedSamples.length < 2) {
@@ -172,30 +305,72 @@ const updateRealtimeSpeed = (bytesUploaded) => {
   const first = speedSamples[0]
   const last = speedSamples[speedSamples.length - 1]
   const elapsedSeconds = (last.time - first.time) / 1000
-  const uploadedBytes = last.bytes - first.bytes
+  const confirmedBytes = last.bytes - first.bytes
 
-  currentSpeedMbps.value = elapsedSeconds > 0 && uploadedBytes > 0
-    ? ((uploadedBytes * 8) / elapsedSeconds / 1000 / 1000).toFixed(2)
-    : '0.00'
+  const speedMbps = elapsedSeconds > 0 && confirmedBytes > 0
+    ? (confirmedBytes * 8) / elapsedSeconds / 1000 / 1000
+    : 0
+
+  currentSpeedMbps.value = formatSpeedMbps(speedMbps)
+  currentBandwidthUtilization.value = formatUtilization(speedMbps)
+
+  if (speedMbps > Number(peakSpeedMbps.value)) {
+    peakSpeedMbps.value = formatSpeedMbps(speedMbps)
+    peakBandwidthUtilization.value = formatUtilization(speedMbps)
+  }
+
+  speedHistory.value = [
+    ...speedHistory.value,
+    { time: now, mbps: speedMbps }
+  ]
+  updateAverageMetrics()
 }
 
 const finishStats = () => {
+  stopActiveUploadTiming()
+
   const finishedAt = new Date()
   const startedAt = uploadStartedAt.value || finishedAt
-  const durationMs = Math.max(
-    0,
-    finishedAt.getTime() - startedAt.getTime() - pausedDurationMs.value
-  )
+  const durationMs = Math.max(0, getActiveUploadDurationMs())
 
-  const averageSpeedMbps = durationMs > 0
-    ? ((file.value.size * 8) / (durationMs / 1000) / 1000 / 1000).toFixed(2)
-    : '0.00'
+  const averageSpeedMbps = durationMs > 0 && confirmedBytesUploaded > 0
+    ? (confirmedBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
+    : 0
+
+  averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeedMbps)
+  averageBandwidthUtilization.value = formatUtilization(averageSpeedMbps)
 
   uploadStats.value = {
     startedAt,
     finishedAt,
     durationText: formatDuration(durationMs),
-    averageSpeedMbps
+    confirmedBytes: confirmedBytesUploaded,
+    averageSpeedMbps: formatSpeedMbps(averageSpeedMbps),
+    averageBandwidthUtilization: formatUtilization(averageSpeedMbps),
+    peakSpeedMbps: peakSpeedMbps.value,
+    peakBandwidthUtilization: peakBandwidthUtilization.value
+  }
+}
+
+const applyServerUploadMetric = (metric) => {
+  if (!metric || !uploadStats.value) return
+
+  const confirmedBytes = Number(metric.bytes)
+  const durationMs = Number(metric.duration_ms)
+  if (!Number.isFinite(confirmedBytes) || !Number.isFinite(durationMs) || confirmedBytes <= 0 || durationMs <= 0) {
+    return
+  }
+
+  const averageSpeed = (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
+  averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
+  averageBandwidthUtilization.value = formatUtilization(averageSpeed)
+
+  uploadStats.value = {
+    ...uploadStats.value,
+    durationText: formatDuration(durationMs),
+    confirmedBytes,
+    averageSpeedMbps: formatSpeedMbps(averageSpeed),
+    averageBandwidthUtilization: formatUtilization(averageSpeed)
   }
 }
 
@@ -205,16 +380,8 @@ const startUpload = () => {
   uploading.value = true
   uploaded.value = false
   uploadStats.value = null
-
-  if (!uploadStartedAt.value) {
-    uploadStartedAt.value = new Date()
-    pausedDurationMs.value = 0
-  }
-
-  if (pausedAt.value) {
-    pausedDurationMs.value += Date.now() - pausedAt.value.getTime()
-    pausedAt.value = null
-  }
+  uploadStartedAt.value = null
+  resetTransferMetrics()
 
   const headers = buildHeaders()
 
@@ -230,12 +397,15 @@ const startUpload = () => {
     onError: (error) => {
       console.error('Failed because:', error)
       ElMessage.error('上传失败: ' + error.message)
+      stopActiveUploadTiming()
       uploading.value = false
     },
     onProgress: (bytesUploaded, bytesTotal) => {
       const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2)
       progress.value = Number(percentage)
-      updateRealtimeSpeed(bytesUploaded)
+    },
+    onChunkComplete: (chunkSize) => {
+      updateConfirmedSpeed(chunkSize)
     },
     onSuccess: async () => {
       uploading.value = false
@@ -248,6 +418,7 @@ const startUpload = () => {
       try {
         const res = await axios.post('/api/get-code', { upload_id: uploadId })
         shareCode.value = res.data.code
+        applyServerUploadMetric(res.data.upload_metric)
       } catch (err) {
         console.error('Generate share code error:', err)
         ElMessage.error('生成取件码失败')
@@ -259,6 +430,7 @@ const startUpload = () => {
     if (previousUploads.length) {
       upload.resumeFromPreviousUpload(previousUploads[0])
     }
+    beginActiveUploadTiming()
     upload.start()
   })
 }
@@ -266,20 +438,16 @@ const startUpload = () => {
 const pauseUpload = () => {
   if (upload) {
     upload.abort()
+    stopActiveUploadTiming()
     uploading.value = false
     paused.value = true
-    pausedAt.value = new Date()
     resetSpeedWindow()
   }
 }
 
 const resumeUpload = () => {
   if (upload) {
-    if (pausedAt.value) {
-      pausedDurationMs.value += Date.now() - pausedAt.value.getTime()
-      pausedAt.value = null
-    }
-    resetSpeedWindow()
+    beginActiveUploadTiming()
     upload.start()
     uploading.value = true
     paused.value = false
@@ -303,11 +471,95 @@ const resumeUpload = () => {
 
 .speed-display {
   display: flex;
+  flex-wrap: wrap;
   justify-content: center;
   gap: 18px;
   margin-top: 10px;
   color: #606266;
   font-size: 13px;
+}
+
+.bandwidth-panel {
+  margin: 14px auto 0;
+  max-width: 760px;
+}
+
+.metric-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  text-align: left;
+  border-top: 1px solid #ebeef5;
+  border-bottom: 1px solid #ebeef5;
+}
+
+.metric-item {
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid #ebeef5;
+}
+
+.metric-item:last-child {
+  border-right: 0;
+}
+
+.metric-label {
+  display: block;
+  margin-bottom: 4px;
+  color: #909399;
+  font-size: 12px;
+}
+
+.metric-item strong {
+  display: block;
+  color: #303133;
+  font-size: 16px;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.speed-chart {
+  margin-top: 12px;
+  padding: 10px 12px 12px;
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  color: #606266;
+  font-size: 12px;
+}
+
+.speed-chart svg {
+  display: block;
+  width: 100%;
+  height: 120px;
+}
+
+.chart-axis {
+  stroke: #e4e7ed;
+  stroke-width: 1;
+}
+
+.chart-line {
+  fill: none;
+  stroke: #409eff;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 640px) {
+  .metric-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .metric-item:nth-child(2n) {
+    border-right: 0;
+  }
 }
 
 .code-display {

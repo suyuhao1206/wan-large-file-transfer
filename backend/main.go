@@ -36,7 +36,9 @@ import (
 var (
     codeToUpload = make(map[string]UploadRecord)
     s3KeyCache   = make(map[string]string)
+	uploadMetrics = make(map[string]UploadMetric)
     mu           sync.RWMutex
+	metricsMu    sync.RWMutex
     
     // Global components
     composer        *handler.StoreComposer
@@ -57,6 +59,11 @@ var (
 type UploadRecord struct {
 	UploadID string `json:"upload_id"`
 	Filename string `json:"filename"`
+}
+
+type UploadMetric struct {
+	Bytes    int64
+	Duration time.Duration
 }
 
 func main() {
@@ -448,6 +455,9 @@ func main() {
 		// 2. Handle Tusd Protocol (POST, PATCH, HEAD, etc.)
 		// Or GET without ID (listing? not supported by tusd usually)
 		// Pass to tusd
+		metricStartedAt := time.Now()
+		requestOffset := parseIntHeader(c.Request.Header.Get("Upload-Offset"))
+
 		var ownerHash string
 		if c.Request.Method == http.MethodPost {
 			if value, exists := c.Get("api_key_hash"); exists {
@@ -458,6 +468,15 @@ func main() {
 		}
 
 		http.StripPrefix("/files/", tusHandler).ServeHTTP(c.Writer, c.Request)
+
+		if c.Request.Method == http.MethodPatch && uploadID != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
+			responseOffset := parseIntHeader(c.Writer.Header().Get("Upload-Offset"))
+			acceptedBytes := responseOffset - requestOffset
+			if acceptedBytes <= 0 && c.Request.ContentLength > 0 {
+				acceptedBytes = c.Request.ContentLength
+			}
+			recordUploadMetric(uploadID, acceptedBytes, time.Since(metricStartedAt))
+		}
 
 		if c.Request.Method == http.MethodPost && ownerHash != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
 			if uploadID := uploadIDFromLocation(c.Writer.Header().Get("Location")); uploadID != "" {
@@ -1219,7 +1238,7 @@ func getShareCode(c *gin.Context) {
             // Only if code equals uploadID (meaning it was auto-inserted as fallback or legacy)
             if code != req.UploadID {
                  if (!expires.Valid || time.Now().UTC().Before(expires.Time)) && (maxd == 0 || downloads < maxd) {
-                    c.JSON(200, gin.H{"code": code, "filename": filename})
+                    c.JSON(200, shareCodeResponse(req.UploadID, code, filename))
                     return
                  }
             }
@@ -1230,17 +1249,17 @@ func getShareCode(c *gin.Context) {
         for i := 0; i < 5; i++ {
              newCode = genCode(8)
              exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
-             res, ierr := db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,$6,0) ON CONFLICT (code) DO NOTHING", newCode, req.UploadID, filenameOrCache(req.UploadID), nullableString(ownerHash), exp, maxDownloads)
-             if ierr == nil {
-                 if rows, _ := res.RowsAffected(); rows > 0 {
-                     c.JSON(200, gin.H{"code": newCode, "filename": filenameOrCache(req.UploadID)})
-                     return
-                 }
-             }
+              res, ierr := db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,$6,0) ON CONFLICT (code) DO NOTHING", newCode, req.UploadID, filenameOrCache(req.UploadID), nullableString(ownerHash), exp, maxDownloads)
+              if ierr == nil {
+                  if rows, _ := res.RowsAffected(); rows > 0 {
+                      c.JSON(200, shareCodeResponse(req.UploadID, newCode, filenameOrCache(req.UploadID)))
+                      return
+                  }
+              }
         }
         
         // Fallback to UploadID as code
-        c.JSON(200, gin.H{"code": req.UploadID, "filename": filenameOrCache(req.UploadID)})
+        c.JSON(200, shareCodeResponse(req.UploadID, req.UploadID, filenameOrCache(req.UploadID)))
         return
     }
 
@@ -1288,7 +1307,7 @@ func getShareCode(c *gin.Context) {
         _, _ = db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, expires_at, max_downloads) VALUES($1,$2,$3,$4,$5) ON CONFLICT (code) DO UPDATE SET filename=EXCLUDED.filename", req.UploadID, req.UploadID, record.Filename, exp, maxDownloads)
     }
 
-    c.JSON(200, gin.H{"code": req.UploadID, "filename": record.Filename})
+    c.JSON(200, shareCodeResponse(req.UploadID, req.UploadID, record.Filename))
 }
 
 func retrieveFile(c *gin.Context) {
@@ -1403,6 +1422,57 @@ func filenameOrCache(uploadID string) string {
 
 func nullableString(value string) sql.NullString {
 	return sql.NullString{String: value, Valid: value != ""}
+}
+
+func parseIntHeader(value string) int64 {
+	if value == "" {
+		return 0
+	}
+
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	return parsed
+}
+
+func recordUploadMetric(uploadID string, bytes int64, duration time.Duration) {
+	if uploadID == "" || bytes <= 0 || duration <= 0 {
+		return
+	}
+
+	metricsMu.Lock()
+	metric := uploadMetrics[uploadID]
+	metric.Bytes += bytes
+	metric.Duration += duration
+	uploadMetrics[uploadID] = metric
+	metricsMu.Unlock()
+}
+
+func getUploadMetric(uploadID string) (UploadMetric, bool) {
+	if uploadID == "" {
+		return UploadMetric{}, false
+	}
+
+	metricsMu.RLock()
+	metric, exists := uploadMetrics[uploadID]
+	metricsMu.RUnlock()
+
+	return metric, exists && metric.Bytes > 0 && metric.Duration > 0
+}
+
+func shareCodeResponse(uploadID string, code string, filename string) gin.H {
+	response := gin.H{"code": code, "filename": filename}
+	if metric, exists := getUploadMetric(uploadID); exists {
+		response["upload_metric"] = gin.H{
+			"bytes":        metric.Bytes,
+			"duration_ms":  float64(metric.Duration) / float64(time.Millisecond),
+			"average_mbps": float64(metric.Bytes*8) / metric.Duration.Seconds() / 1000 / 1000,
+		}
+	}
+
+	return response
 }
 
 func uploadIDFromLocation(location string) string {
