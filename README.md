@@ -10,7 +10,7 @@
 - 前端上传页显示上传开始时间、结束时间、耗时、确认传输量、平均确认速度和有效带宽利用率。
 - 前端上传过程中显示实时估算速度，按最近 10 秒进度窗口计算 Mbps，并按 100 Mbps 固定带宽估算当前/平均利用率。
 - 上传过程中显示上传全程实时速度曲线。
-- 上传分片大小固定为 64MB，减少大文件上传时的小请求开销。
+- 上传分片大小固定为 64MB，并默认启用 3 路 tus 并行上传以提高带宽利用率。
 - 上传完成后自动生成分享码。
 - 支持 API Key / Admin Key 鉴权。
 - 支持管理员查看全部传输记录。
@@ -175,11 +175,11 @@ docker compose --env-file .env.production pull minio
 
 已落地的上传优化：
 
-- 前端 `chunkSize` 设置为 `64 * 1024 * 1024`。
+- 前端 `chunkSize` 设置为 `64 * 1024 * 1024`，`parallelUploads` 设置为 `3`。
 - 前端实时显示最近 10 秒上传进度估算速度。
 - 前端按 100 Mbps 固定带宽显示当前利用率和平均利用率。
 - 前端显示上传全程实时速度曲线。
-- 上传完成后的测试记录优先使用后端 tus `PATCH` 确认字节和耗时统计。
+- 上传完成后的测试记录优先使用后端 tus `PATCH` 确认字节和耗时统计；并行上传会把 partial uploads 聚合到最终 upload ID。
 - 暂停/继续不会污染实时速度窗口，停止上传会通过 tus DELETE 终止并清理后端运行时指标。
 - Nginx `/files/` 已设置：
   - `proxy_request_buffering off`
@@ -193,7 +193,7 @@ docker compose --env-file .env.production pull minio
   - `tcp_nodelay on`
   - `proxy_socket_keepalive on`
 
-后续如果 100Mbps/200Mbps 仍跑不满，可以继续测试 tus 并行上传、后端 S3 HTTP 连接池和对象存储直传。
+后续如果 100Mbps/200Mbps 仍跑不满，可以继续测试更高并行数、后端 S3 HTTP 连接池和对象存储直传。
 
 ## 传输记录
 
@@ -334,7 +334,7 @@ proxy_set_header Connection "";
 ## 后续可优化方向
 
 - 增加下载明细日志表，记录每次下载时间、IP、User-Agent 和下载者 Key。
-- 增加 tus 并行上传配置项。
+- 增加 tus 并行上传配置项，支持通过环境变量调整并行数。
 - 给后端 S3 Client 增加自定义 HTTP 连接池。
 - 支持 S3 multipart 预签名直传，减少后端中转压力。
 - 增加定期清理过期文件和分享码的任务。

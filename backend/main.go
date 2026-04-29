@@ -15,6 +15,7 @@ import (
     "os"
     "path/filepath"
     "regexp"
+    "sort"
     "strings"
     "sync"
     "time"
@@ -63,7 +64,12 @@ type UploadRecord struct {
 
 type UploadMetric struct {
 	Bytes    int64
-	Duration time.Duration
+	Intervals []UploadMetricInterval
+}
+
+type UploadMetricInterval struct {
+	Start time.Time
+	End   time.Time
 }
 
 func main() {
@@ -229,6 +235,15 @@ func main() {
         for {
             event := <-tusHandler.CompleteUploads
             uploadID := event.Upload.ID
+
+			if event.Upload.IsPartial {
+				log.Printf("Event: Partial upload completed - ID: %s", uploadID)
+				continue
+			}
+
+			if event.Upload.IsFinal {
+				aggregateUploadMetrics(uploadID, event.Upload.PartialUploads)
+			}
             
             filename := extractFilename(event.Upload.MetaData)
 
@@ -318,8 +333,8 @@ func main() {
     r.Use(cors.New(cors.Config{
         AllowOrigins:  origins,
         AllowMethods:  []string{"GET", "POST", "PATCH", "HEAD", "OPTIONS", "DELETE"},
-        AllowHeaders:  []string{"Origin", "Content-Type", "Upload-Length", "Upload-Metadata", "Tus-Resumable", "Upload-Offset", "Authorization", "X-API-Key", "X-Admin-Key"},
-        ExposeHeaders: []string{"Upload-Length", "Upload-Metadata", "Tus-Resumable", "Upload-Offset", "Location", "Tus-Version"},
+        AllowHeaders:  []string{"Origin", "Content-Type", "Upload-Length", "Upload-Metadata", "Upload-Concat", "Tus-Resumable", "Upload-Offset", "Authorization", "X-API-Key", "X-Admin-Key"},
+        ExposeHeaders: []string{"Upload-Length", "Upload-Metadata", "Upload-Concat", "Tus-Resumable", "Upload-Offset", "Location", "Tus-Version"},
         AllowCredentials: false,
     }))
 
@@ -480,12 +495,13 @@ func main() {
 		http.StripPrefix("/files/", tusHandler).ServeHTTP(c.Writer, c.Request)
 
 		if c.Request.Method == http.MethodPatch && uploadID != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
+			metricFinishedAt := time.Now()
 			responseOffset := parseIntHeader(c.Writer.Header().Get("Upload-Offset"))
 			acceptedBytes := responseOffset - requestOffset
 			if acceptedBytes <= 0 && c.Request.ContentLength > 0 {
 				acceptedBytes = c.Request.ContentLength
 			}
-			recordUploadMetric(uploadID, acceptedBytes, time.Since(metricStartedAt))
+			recordUploadMetric(uploadID, acceptedBytes, metricStartedAt, metricFinishedAt)
 		}
 
 		if c.Request.Method == http.MethodDelete && uploadID != "" && c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
@@ -1235,6 +1251,8 @@ func getShareCode(c *gin.Context) {
         return
     }
 
+	refreshCompletedUploadRuntimeInfo(req.UploadID)
+
     if db != nil {
         var code string
         var filename string
@@ -1451,16 +1469,41 @@ func parseIntHeader(value string) int64 {
 	return parsed
 }
 
-func recordUploadMetric(uploadID string, bytes int64, duration time.Duration) {
-	if uploadID == "" || bytes <= 0 || duration <= 0 {
+func recordUploadMetric(uploadID string, bytes int64, startedAt time.Time, finishedAt time.Time) {
+	if uploadID == "" || bytes <= 0 || !finishedAt.After(startedAt) {
 		return
 	}
 
 	metricsMu.Lock()
 	metric := uploadMetrics[uploadID]
 	metric.Bytes += bytes
-	metric.Duration += duration
+	metric.Intervals = append(metric.Intervals, UploadMetricInterval{Start: startedAt, End: finishedAt})
 	uploadMetrics[uploadID] = metric
+	metricsMu.Unlock()
+}
+
+func aggregateUploadMetrics(finalUploadID string, partialUploadIDs []string) {
+	if finalUploadID == "" || len(partialUploadIDs) == 0 {
+		return
+	}
+
+	metricsMu.Lock()
+	finalMetric := uploadMetrics[finalUploadID]
+	for _, partialUploadID := range partialUploadIDs {
+		if partialUploadID == "" || partialUploadID == finalUploadID {
+			continue
+		}
+
+		partialMetric, exists := uploadMetrics[partialUploadID]
+		if !exists {
+			continue
+		}
+
+		finalMetric.Bytes += partialMetric.Bytes
+		finalMetric.Intervals = append(finalMetric.Intervals, partialMetric.Intervals...)
+		delete(uploadMetrics, partialUploadID)
+	}
+	uploadMetrics[finalUploadID] = finalMetric
 	metricsMu.Unlock()
 }
 
@@ -1486,18 +1529,84 @@ func getUploadMetric(uploadID string) (UploadMetric, bool) {
 
 	metricsMu.RLock()
 	metric, exists := uploadMetrics[uploadID]
+	if exists {
+		metric.Intervals = append([]UploadMetricInterval(nil), metric.Intervals...)
+	}
 	metricsMu.RUnlock()
 
-	return metric, exists && metric.Bytes > 0 && metric.Duration > 0
+	return metric, exists && metric.Bytes > 0 && uploadMetricDuration(metric) > 0
+}
+
+func refreshCompletedUploadRuntimeInfo(uploadID string) {
+	if uploadID == "" || dataStore == nil {
+		return
+	}
+
+	upload, err := dataStore.GetUpload(context.Background(), uploadID)
+	if err != nil {
+		return
+	}
+
+	info, err := upload.GetInfo(context.Background())
+	if err != nil || info.IsPartial {
+		return
+	}
+
+	if info.IsFinal {
+		aggregateUploadMetrics(uploadID, info.PartialUploads)
+	}
+
+	filename := extractFilename(info.MetaData)
+	mu.Lock()
+	if _, exists := codeToUpload[uploadID]; !exists {
+		codeToUpload[uploadID] = UploadRecord{UploadID: uploadID, Filename: filename}
+	}
+	mu.Unlock()
+}
+
+func uploadMetricDuration(metric UploadMetric) time.Duration {
+	if len(metric.Intervals) == 0 {
+		return 0
+	}
+
+	intervals := append([]UploadMetricInterval(nil), metric.Intervals...)
+	sort.Slice(intervals, func(i, j int) bool {
+		return intervals[i].Start.Before(intervals[j].Start)
+	})
+
+	var total time.Duration
+	currentStart := intervals[0].Start
+	currentEnd := intervals[0].End
+
+	for _, interval := range intervals[1:] {
+		if interval.End.Before(interval.Start) || interval.End.Equal(interval.Start) {
+			continue
+		}
+
+		if interval.Start.After(currentEnd) {
+			total += currentEnd.Sub(currentStart)
+			currentStart = interval.Start
+			currentEnd = interval.End
+			continue
+		}
+
+		if interval.End.After(currentEnd) {
+			currentEnd = interval.End
+		}
+	}
+
+	total += currentEnd.Sub(currentStart)
+	return total
 }
 
 func shareCodeResponse(uploadID string, code string, filename string) gin.H {
 	response := gin.H{"code": code, "filename": filename}
 	if metric, exists := getUploadMetric(uploadID); exists {
+		duration := uploadMetricDuration(metric)
 		response["upload_metric"] = gin.H{
 			"bytes":        metric.Bytes,
-			"duration_ms":  float64(metric.Duration) / float64(time.Millisecond),
-			"average_mbps": float64(metric.Bytes*8) / metric.Duration.Seconds() / 1000 / 1000,
+			"duration_ms":  float64(duration) / float64(time.Millisecond),
+			"average_mbps": float64(metric.Bytes) * 8 / duration.Seconds() / 1000 / 1000,
 		}
 	}
 

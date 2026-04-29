@@ -22,6 +22,7 @@
         <span>固定带宽：{{ FIXED_BANDWIDTH_MBPS }} Mbps</span>
         <span>当前利用率：{{ currentBandwidthUtilization }}%</span>
         <span>分片大小：{{ formatSize(UPLOAD_CHUNK_SIZE) }}</span>
+        <span>并行上传：{{ PARALLEL_UPLOADS }} 路</span>
       </div>
 
       <div class="bandwidth-panel" v-if="uploading || paused || uploaded">
@@ -117,6 +118,7 @@ const SPEED_WINDOW_MS = 10 * 1000
 const SPEED_CHART_WIDTH = 600
 const SPEED_CHART_HEIGHT = 120
 const FIXED_BANDWIDTH_MBPS = 100
+const PARALLEL_UPLOADS = 3
 
 let upload = null
 let speedSamples = []
@@ -401,6 +403,7 @@ const startUpload = () => {
   upload = new tus.Upload(file.value, {
     endpoint: '/files/',
     chunkSize: UPLOAD_CHUNK_SIZE,
+    parallelUploads: PARALLEL_UPLOADS,
     retryDelays: [0, 3000, 5000, 10000, 20000],
     headers,
     metadata: {
@@ -479,11 +482,7 @@ const stopUpload = async () => {
 
   try {
     try {
-      if (upload.url) {
-        await upload.abort(true)
-      } else {
-        await upload.abort()
-      }
+      await upload.abort(true)
     } catch (err) {
       if (uploadId) {
         await terminateUploadOnServer(uploadId)
