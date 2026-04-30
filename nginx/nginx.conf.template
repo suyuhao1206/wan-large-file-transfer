@@ -35,22 +35,15 @@ http {
     }
 
     server {
-        listen       443 ssl;
-        server_name  ${NGINX_SERVER_NAME};
-
-        ssl_certificate      /etc/nginx/certs/${NGINX_SSL_CERTIFICATE};
-        ssl_certificate_key  /etc/nginx/certs/${NGINX_SSL_CERTIFICATE_KEY};
-        ssl_session_cache    shared:SSL:1m;
-        ssl_session_timeout  5m;
-
-        ssl_ciphers  HIGH:!aNULL:!MD5;
-        ssl_prefer_server_ciphers  on;
+        listen       80 default_server;
+        server_name  _;
 
         location / {
             proxy_pass http://frontend;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
         }
 
         location /api {
@@ -58,12 +51,13 @@ http {
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
         }
 
         location /${S3_BUCKET}/ {
             proxy_pass http://minio;
             proxy_http_version 1.1;
-            proxy_set_header Host $host;
+            proxy_set_header Host ${NGINX_SERVER_NAME};
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
@@ -83,9 +77,82 @@ http {
             proxy_request_buffering off;
             proxy_buffering off;
             proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Host $host;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header Connection "";
+            proxy_redirect https://${NGINX_SERVER_NAME}/ $scheme://$http_host/;
+
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+
+            proxy_set_header Tus-Resumable $http_tus_resumable;
+            proxy_set_header Upload-Length $http_upload_length;
+            proxy_set_header Upload-Metadata $http_upload_metadata;
+            proxy_set_header Upload-Offset $http_upload_offset;
+        }
+    }
+
+    server {
+        listen       443 ssl;
+        server_name  ${NGINX_SERVER_NAME};
+
+        ssl_certificate      /etc/nginx/certs/${NGINX_SSL_CERTIFICATE};
+        ssl_certificate_key  /etc/nginx/certs/${NGINX_SSL_CERTIFICATE_KEY};
+        ssl_session_cache    shared:SSL:1m;
+        ssl_session_timeout  5m;
+
+        ssl_ciphers  HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers  on;
+
+        location / {
+            proxy_pass http://frontend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /api {
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /${S3_BUCKET}/ {
+            proxy_pass http://minio;
+            proxy_http_version 1.1;
+            proxy_set_header Host ${NGINX_SERVER_NAME};
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection "";
+            proxy_request_buffering off;
+            proxy_buffering on;
+            proxy_buffers 16 512k;
+            proxy_busy_buffers_size 1m;
+            proxy_max_temp_file_size 0;
+
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
+        location /files/ {
+            proxy_pass http://backend;
+            proxy_request_buffering off;
+            proxy_buffering off;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection "";
+            proxy_redirect https://${NGINX_SERVER_NAME}/ $scheme://$http_host/;
 
             proxy_read_timeout 86400s;
             proxy_send_timeout 86400s;

@@ -13,7 +13,7 @@ RUN go env -w GOPROXY=https://goproxy.cn,direct
 RUN go mod tidy
 RUN go build -o server main.go
 
-FROM alpine:latest
+FROM alpine:3.22
 
 WORKDIR /app
 

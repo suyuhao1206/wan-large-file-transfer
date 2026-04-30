@@ -72,6 +72,16 @@ type UploadMetricInterval struct {
 	End   time.Time
 }
 
+func shareCodeExpiresAt() sql.NullTime {
+	if ttlMinutes <= 0 {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{
+		Time:  time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute),
+		Valid: true,
+	}
+}
+
 func main() {
     // Environment variables
     s3Endpoint = os.Getenv("S3_ENDPOINT")
@@ -87,7 +97,7 @@ func main() {
     ttlMinutesStr := os.Getenv("SHARE_CODE_TTL_MINUTES")
     maxDownloadsStr := os.Getenv("SHARE_CODE_MAX_DOWNLOADS")
     ttlMinutes = 120
-    if n, err := strconv.Atoi(ttlMinutesStr); err == nil && n > 0 { ttlMinutes = n }
+    if n, err := strconv.Atoi(ttlMinutesStr); err == nil && n >= 0 { ttlMinutes = n }
     maxDownloads = 10000
     if n, err := strconv.Atoi(maxDownloadsStr); err == nil && n > 0 { maxDownloads = n }
     corsOrigins := os.Getenv("CORS_ORIGINS")
@@ -115,6 +125,11 @@ func main() {
                 _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_share_codes_upload ON share_codes(upload_id)`)
                 _, _ = db.Exec(`ALTER TABLE share_codes ADD COLUMN IF NOT EXISTS owner_key_hash TEXT`)
                 _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_share_codes_owner ON share_codes(owner_key_hash)`)
+                if ttlMinutes <= 0 {
+                    if _, err := db.Exec(`UPDATE share_codes SET expires_at = NULL WHERE expires_at IS NOT NULL`); err != nil {
+                        log.Printf("Failed to disable share code expiration: %v", err)
+                    }
+                }
                 _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS upload_owners (
                     upload_id TEXT PRIMARY KEY,
                     owner_key_hash TEXT NOT NULL,
@@ -264,7 +279,7 @@ func main() {
 				// Retry loop for short code generation
 				for i := 0; i < 5; i++ {
 					shortCode = genCode(8) // Generate 8-char code
-					exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
+					exp := shareCodeExpiresAt()
 					
 					// Try insert
 					res, err := db.ExecContext(ctx, 
@@ -423,7 +438,7 @@ func main() {
                         return
                     }
                     fname = extractFilename(info.MetaData)
-                    exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
+                    exp := shareCodeExpiresAt()
                     
                     // Auto-register
                     _, _ = db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,0) ON CONFLICT (code) DO UPDATE SET filename=EXCLUDED.filename WHERE share_codes.upload_id = EXCLUDED.upload_id", code, uploadID, fname, exp, maxDownloads)
@@ -1280,7 +1295,7 @@ func getShareCode(c *gin.Context) {
         var newCode string
         for i := 0; i < 5; i++ {
              newCode = genCode(8)
-             exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
+             exp := shareCodeExpiresAt()
               res, ierr := db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,$6,0) ON CONFLICT (code) DO NOTHING", newCode, req.UploadID, filenameOrCache(req.UploadID), nullableString(ownerHash), exp, maxDownloads)
               if ierr == nil {
                   if rows, _ := res.RowsAffected(); rows > 0 {
@@ -1335,7 +1350,7 @@ func getShareCode(c *gin.Context) {
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
         
-        exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
+        exp := shareCodeExpiresAt()
         _, _ = db.ExecContext(ctx, "INSERT INTO share_codes(code, upload_id, filename, expires_at, max_downloads) VALUES($1,$2,$3,$4,$5) ON CONFLICT (code) DO UPDATE SET filename=EXCLUDED.filename", req.UploadID, req.UploadID, record.Filename, exp, maxDownloads)
     }
 
@@ -1387,7 +1402,7 @@ func retrieveFile(c *gin.Context) {
             return
         }
         resolved := extractFilename(info.MetaData)
-        exp := time.Now().UTC().Add(time.Duration(ttlMinutes) * time.Minute)
+        exp := shareCodeExpiresAt()
         // Insert mapping and avoid hijacking existing short codes by only updating
         // when the existing row already points to the same upload_id.
         _, _ = db.ExecContext(ctx, `
