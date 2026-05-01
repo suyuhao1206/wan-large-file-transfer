@@ -41,15 +41,18 @@
           </div>
         </div>
 
-        <div class="speed-chart" v-if="speedChartPolyline">
+        <div class="speed-chart" v-if="speedChartBars.length">
           <div class="chart-header">
-            <span>实时速度曲线</span>
-            <span>上传全程</span>
+            <span>实时速度</span>
+            <span>最近2分钟</span>
           </div>
-          <svg viewBox="0 0 600 120" role="img" aria-label="上传全程实时速度曲线">
-            <line x1="0" y1="119" x2="600" y2="119" class="chart-axis" />
-            <polyline :points="speedChartPolyline" class="chart-line" />
-          </svg>
+          <div class="speed-bars" role="img" aria-label="最近2分钟上传速度柱状图">
+            <span
+              v-for="bar in speedChartBars"
+              :key="bar.key"
+              :style="{ height: bar.height }"
+            ></span>
+          </div>
         </div>
       </div>
 
@@ -71,13 +74,24 @@
 
     <div v-if="uploaded" class="result-box">
       <div class="result-header">
-        <div class="result-status">上传成功</div>
+        <div class="result-status">上传成功！</div>
         <div class="result-subtitle">文件已经准备好分享</div>
       </div>
 
       <div class="code-display">
         <span>取件码</span>
-        <strong class="code">{{ shareCode || '生成中' }}</strong>
+        <div class="code-row">
+          <strong class="code">{{ shareCode || '生成中' }}</strong>
+          <el-button
+            class="copy-code-button"
+            size="small"
+            :disabled="!shareCode"
+            @click="copyShareCode"
+          >
+            <el-icon><CopyDocument /></el-icon>
+            <span>复制</span>
+          </el-button>
+        </div>
       </div>
 
       <div v-if="uploadStats" class="stats-display">
@@ -117,7 +131,7 @@
 import { computed, ref } from 'vue'
 import * as tus from 'tus-js-client'
 import axios from 'axios'
-import { UploadFilled } from '@element-plus/icons-vue'
+import { CopyDocument, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { getApiKey, getAdminKey } from '../config.js'
 
@@ -137,12 +151,8 @@ const speedHistory = ref([])
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
 const SPEED_WINDOW_MS = 30 * 1000
 const UI_PROGRESS_UPDATE_MS = 500
-const SPEED_HISTORY_FINE_SAMPLE_MS = 30 * 1000
-const SPEED_HISTORY_FINE_WINDOW_MS = 60 * 60 * 1000
-const SPEED_HISTORY_COARSE_SAMPLE_MS = 5 * 60 * 1000
-const SPEED_HISTORY_MAX_POINTS = 500
-const SPEED_CHART_WIDTH = 600
-const SPEED_CHART_HEIGHT = 120
+const SPEED_HISTORY_SAMPLE_MS = 1000
+const SPEED_HISTORY_MAX_POINTS = 120
 const FIXED_BANDWIDTH_MBPS = 100
 const SPEED_DISPLAY_MAX_MBPS = FIXED_BANDWIDTH_MBPS
 const PARALLEL_UPLOADS = 4
@@ -162,24 +172,22 @@ const bandwidthUsageWidth = computed(() => {
   return `${safeUtilization}%`
 })
 
-const speedChartPolyline = computed(() => {
-  if (speedHistory.value.length < 2) return ''
+const speedChartBars = computed(() => {
+  if (!speedHistory.value.length) return []
 
-  const latest = speedHistory.value[speedHistory.value.length - 1].time
-  const started = speedHistory.value[0].time
-  const duration = Math.max(1, latest - started)
   const maxSpeed = Math.max(
     FIXED_BANDWIDTH_MBPS,
     ...speedHistory.value.map(sample => sample.mbps)
   )
 
   return speedHistory.value
-    .map((sample) => {
-      const x = ((sample.time - started) / duration) * SPEED_CHART_WIDTH
-      const y = SPEED_CHART_HEIGHT - Math.min(sample.mbps / maxSpeed, 1) * (SPEED_CHART_HEIGHT - 2) - 1
-      return `${Math.max(0, Math.min(SPEED_CHART_WIDTH, x)).toFixed(1)},${y.toFixed(1)}`
+    .map((sample, index) => {
+      const ratio = maxSpeed > 0 ? Math.min(sample.mbps / maxSpeed, 1) : 0
+      return {
+        key: `${Math.round(sample.time)}-${index}`,
+        height: `${Math.max(4, ratio * 100).toFixed(1)}%`
+      }
     })
-    .join(' ')
 })
 
 const resetUploadState = () => {
@@ -284,6 +292,31 @@ const buildHeaders = () => {
   return headers
 }
 
+const copyShareCode = async () => {
+  if (!shareCode.value) return
+
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(shareCode.value)
+    } else {
+      const textarea = document.createElement('textarea')
+      textarea.value = shareCode.value
+      textarea.setAttribute('readonly', '')
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+
+    ElMessage.success('取件码已复制')
+  } catch (err) {
+    console.error('Copy share code error:', err)
+    ElMessage.error('复制失败，请手动复制')
+  }
+}
+
 const resetTransferMetrics = () => {
   currentSpeedMbps.value = '0.00'
   averageBandwidthUtilization.value = '0.0'
@@ -298,48 +331,24 @@ const resetTransferMetrics = () => {
   lastProgressUiUpdateAt = 0
 }
 
-const compactSpeedHistory = (history, now) => {
-  const fineCutoff = now - SPEED_HISTORY_FINE_WINDOW_MS
-  const coarseBuckets = new Map()
-  const recentSamples = []
-
-  for (const sample of history) {
-    if (!Number.isFinite(sample.time) || !Number.isFinite(sample.mbps)) {
-      continue
-    }
-
-    if (sample.time >= fineCutoff) {
-      recentSamples.push(sample)
-      continue
-    }
-
-    const bucket = Math.floor(sample.time / SPEED_HISTORY_COARSE_SAMPLE_MS)
-    const existing = coarseBuckets.get(bucket)
-    if (!existing || sample.time > existing.time) {
-      coarseBuckets.set(bucket, sample)
-    }
+const appendSpeedHistory = (sample, force = false) => {
+  if (!Number.isFinite(sample.time) || !Number.isFinite(sample.mbps)) {
+    return
   }
 
-  const compacted = [
-    ...Array.from(coarseBuckets.values()).sort((a, b) => a.time - b.time),
-    ...recentSamples
-  ]
-
-  return compacted.length > SPEED_HISTORY_MAX_POINTS
-    ? compacted.slice(compacted.length - SPEED_HISTORY_MAX_POINTS)
-    : compacted
-}
-
-const appendSpeedHistory = (sample, force = false) => {
-  if (!force && lastSpeedHistorySampleAt && sample.time - lastSpeedHistorySampleAt < SPEED_HISTORY_FINE_SAMPLE_MS) {
+  if (!force && lastSpeedHistorySampleAt && sample.time - lastSpeedHistorySampleAt < SPEED_HISTORY_SAMPLE_MS) {
     return
   }
 
   lastSpeedHistorySampleAt = sample.time
-  speedHistory.value = compactSpeedHistory([
+  const nextHistory = [
     ...speedHistory.value,
     sample
-  ], sample.time)
+  ]
+
+  speedHistory.value = nextHistory.length > SPEED_HISTORY_MAX_POINTS
+    ? nextHistory.slice(nextHistory.length - SPEED_HISTORY_MAX_POINTS)
+    : nextHistory
 }
 
 const resetSpeedWindow = (now = performance.now()) => {
@@ -400,7 +409,7 @@ const updateAverageMetrics = () => {
   }
 }
 
-const updateRealtimeSpeed = (bytesUploaded, now = performance.now()) => {
+const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistory = false) => {
   if (!Number.isFinite(bytesUploaded) || bytesUploaded < 0) return
 
   realtimeBytesUploaded = bytesUploaded
@@ -424,7 +433,7 @@ const updateRealtimeSpeed = (bytesUploaded, now = performance.now()) => {
   const displaySpeedMbps = clampDisplaySpeedMbps(speedMbps)
   currentSpeedMbps.value = formatSpeedMbps(displaySpeedMbps)
 
-  appendSpeedHistory({ time: now, mbps: displaySpeedMbps })
+  appendSpeedHistory({ time: now, mbps: displaySpeedMbps }, forceHistory || speedHistory.value.length <= 1)
   updateAverageMetrics()
 }
 
@@ -439,7 +448,7 @@ const updateUploadProgress = (bytesUploaded, bytesTotal, force = false) => {
   lastProgressUiUpdateAt = now
   const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2)
   progress.value = Math.min(100, Number(percentage))
-  updateRealtimeSpeed(bytesUploaded, now)
+  updateRealtimeSpeed(bytesUploaded, now, force)
 }
 
 const updateConfirmedSpeed = (chunkSize) => {
@@ -755,23 +764,22 @@ const stopUpload = async () => {
   font-size: 12px;
 }
 
-.speed-chart svg {
-  display: block;
-  width: 100%;
+.speed-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
   height: 120px;
+  padding: 0 2px;
+  border-bottom: 1px solid #e4e7ed;
 }
 
-.chart-axis {
-  stroke: #e4e7ed;
-  stroke-width: 1;
-}
-
-.chart-line {
-  fill: none;
-  stroke: #409eff;
-  stroke-width: 3;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+.speed-bars span {
+  flex: 1 1 0;
+  min-width: 2px;
+  max-width: 8px;
+  border-radius: 2px 2px 0 0;
+  background: #409eff;
+  transition: height 0.2s ease;
 }
 
 @media (max-width: 640px) {
@@ -827,12 +835,19 @@ const stopUpload = async () => {
   background: #f6ffed;
 }
 
-.code-display span {
+.code-display > span {
   display: block;
   margin-bottom: 8px;
   color: #529b2e;
   font-size: 12px;
   font-weight: 600;
+}
+
+.code-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
 }
 
 .code {
@@ -843,6 +858,10 @@ const stopUpload = async () => {
   letter-spacing: 0;
   word-break: break-all;
   font-family: monospace;
+}
+
+.copy-code-button {
+  flex: 0 0 auto;
 }
 
 .stats-display {
@@ -907,6 +926,14 @@ const stopUpload = async () => {
 
   .code {
     font-size: 24px;
+  }
+
+  .code-row {
+    display: block;
+  }
+
+  .copy-code-button {
+    margin-top: 10px;
   }
 
   .stats-grid {
