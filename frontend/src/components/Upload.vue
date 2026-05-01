@@ -80,18 +80,16 @@
 
       <div class="code-display">
         <span>取件码</span>
-        <div class="code-row">
-          <strong class="code">{{ shareCode || '生成中' }}</strong>
-          <el-button
-            class="copy-code-button"
-            size="small"
-            :disabled="!shareCode"
-            @click="copyShareCode"
-          >
-            <el-icon><CopyDocument /></el-icon>
-            <span>复制</span>
-          </el-button>
-        </div>
+        <strong class="code">{{ shareCode || '生成中' }}</strong>
+        <el-button
+          class="copy-code-button"
+          size="small"
+          :disabled="!shareCode"
+          @click="copyShareCode"
+        >
+          <el-icon><CopyDocument /></el-icon>
+          <span>复制</span>
+        </el-button>
       </div>
 
       <div v-if="uploadStats" class="stats-display">
@@ -828,6 +826,7 @@ const stopUpload = async () => {
 }
 
 .code-display {
+  position: relative;
   margin-top: 16px;
   padding: 16px;
   border: 1px solid #b7ebc6;
@@ -843,13 +842,6 @@ const stopUpload = async () => {
   font-weight: 600;
 }
 
-.code-row {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 10px;
-}
-
 .code {
   display: block;
   color: #1f7a4d;
@@ -861,8 +853,9 @@ const stopUpload = async () => {
 }
 
 .copy-code-button {
-  justify-self: start;
-  flex: 0 0 auto;
+  position: absolute;
+  top: 12px;
+  right: 12px;
 }
 
 .stats-display {
@@ -929,11 +922,8 @@ const stopUpload = async () => {
     font-size: 24px;
   }
 
-  .code-row {
-    display: block;
-  }
-
   .copy-code-button {
+    position: static;
     margin-top: 10px;
   }
 
