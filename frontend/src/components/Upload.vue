@@ -844,9 +844,9 @@ const stopUpload = async () => {
 }
 
 .code-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: center;
   gap: 10px;
 }
 
@@ -861,6 +861,7 @@ const stopUpload = async () => {
 }
 
 .copy-code-button {
+  justify-self: start;
   flex: 0 0 auto;
 }
 
