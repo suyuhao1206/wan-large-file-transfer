@@ -15,24 +15,29 @@
     </el-upload>
 
     <div v-if="file" class="file-status">
-      <p>{{ file.name }} ({{ formatSize(file.size) }})</p>
+      <p class="file-summary">{{ file.name }} ({{ formatSize(file.size) }})</p>
       <el-progress :percentage="progress" />
-      <div class="speed-display" v-if="uploading || paused || uploaded">
-        <span>实时速度：{{ currentSpeedMbps }} Mbps</span>
-        <span>参考带宽：{{ FIXED_BANDWIDTH_MBPS }} Mbps</span>
-        <span>当前利用率：{{ currentBandwidthUtilization }}%</span>
-        <span>分片大小：{{ formatSize(UPLOAD_CHUNK_SIZE) }}</span>
-      </div>
 
       <div class="bandwidth-panel" v-if="uploading || paused || uploaded">
         <div class="metric-strip">
-          <div class="metric-item">
-            <span class="metric-label">平均速度</span>
-            <strong>{{ averageConfirmedSpeedMbps }} Mbps</strong>
+          <div class="metric-item metric-primary">
+            <span class="metric-label">上传速率</span>
+            <strong><span>约</span>{{ currentSpeedMbps }}<em>Mbps</em></strong>
+          </div>
+          <div class="metric-item metric-usage">
+            <span class="metric-label">带宽占用</span>
+            <strong>{{ averageBandwidthUtilization }}%</strong>
+            <div class="usage-meter" aria-hidden="true">
+              <span :style="{ width: bandwidthUsageWidth }"></span>
+            </div>
           </div>
           <div class="metric-item">
-            <span class="metric-label">平均利用率</span>
-            <strong>{{ averageBandwidthUtilization }}%</strong>
+            <span class="metric-label">参考带宽</span>
+            <strong>{{ FIXED_BANDWIDTH_MBPS }}<em>Mbps</em></strong>
+          </div>
+          <div class="metric-item">
+            <span class="metric-label">预计剩余</span>
+            <strong>{{ estimatedRemainingText }}</strong>
           </div>
         </div>
 
@@ -65,27 +70,45 @@
     </div>
 
     <div v-if="uploaded" class="result-box">
-      <el-result
-        icon="success"
-        title="上传成功"
-        sub-title="您的文件已经准备好分享"
-      >
-        <template #extra>
-          <div class="code-display">
-            <span>取件码</span>
-            <h1 class="code">{{ shareCode }}</h1>
+      <div class="result-header">
+        <div class="result-status">上传成功</div>
+        <div class="result-subtitle">文件已经准备好分享</div>
+      </div>
+
+      <div class="code-display">
+        <span>取件码</span>
+        <strong class="code">{{ shareCode || '生成中' }}</strong>
+      </div>
+
+      <div v-if="uploadStats" class="stats-display">
+        <div class="stats-title">上传记录</div>
+        <div class="stats-grid">
+          <div class="stats-item">
+            <span>开始时间</span>
+            <strong>{{ formatDateTime(uploadStats.startedAt) }}</strong>
           </div>
-          <div v-if="uploadStats" class="stats-display">
-            <div class="stats-title">上传测试记录</div>
-            <p>开始时间：{{ formatDateTime(uploadStats.startedAt) }}</p>
-            <p>结束时间：{{ formatDateTime(uploadStats.finishedAt) }}</p>
-            <p>上传耗时：{{ uploadStats.durationText }}</p>
-            <p>确认传输量：{{ formatSize(uploadStats.confirmedBytes) }}</p>
-            <p>平均确认速度：{{ uploadStats.averageSpeedMbps }} Mbps</p>
-            <p>有效带宽利用率：{{ uploadStats.averageBandwidthUtilization }}%</p>
+          <div class="stats-item">
+            <span>结束时间</span>
+            <strong>{{ formatDateTime(uploadStats.finishedAt) }}</strong>
           </div>
-        </template>
-      </el-result>
+          <div class="stats-item">
+            <span>上传耗时</span>
+            <strong>{{ uploadStats.durationText }}</strong>
+          </div>
+          <div class="stats-item">
+            <span>确认传输量</span>
+            <strong>{{ formatSize(uploadStats.confirmedBytes) }}</strong>
+          </div>
+          <div class="stats-item">
+            <span>平均确认速度</span>
+            <strong>{{ uploadStats.averageSpeedMbps }} Mbps</strong>
+          </div>
+          <div class="stats-item">
+            <span>有效带宽利用率</span>
+            <strong>{{ uploadStats.averageBandwidthUtilization }}%</strong>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -107,13 +130,12 @@ const shareCode = ref('')
 const uploadStats = ref(null)
 const uploadStartedAt = ref(null)
 const currentSpeedMbps = ref('0.00')
-const currentBandwidthUtilization = ref('0.0')
-const averageConfirmedSpeedMbps = ref('0.00')
 const averageBandwidthUtilization = ref('0.0')
+const estimatedRemainingText = ref('-')
 const speedHistory = ref([])
 
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
-const SPEED_WINDOW_MS = 10 * 1000
+const SPEED_WINDOW_MS = 30 * 1000
 const UI_PROGRESS_UPDATE_MS = 500
 const SPEED_HISTORY_FINE_SAMPLE_MS = 30 * 1000
 const SPEED_HISTORY_FINE_WINDOW_MS = 60 * 60 * 1000
@@ -122,6 +144,7 @@ const SPEED_HISTORY_MAX_POINTS = 500
 const SPEED_CHART_WIDTH = 600
 const SPEED_CHART_HEIGHT = 120
 const FIXED_BANDWIDTH_MBPS = 100
+const SPEED_DISPLAY_MAX_MBPS = FIXED_BANDWIDTH_MBPS
 const PARALLEL_UPLOADS = 4
 
 let upload = null
@@ -132,6 +155,12 @@ let activeUploadStartedAtMs = null
 let activeUploadDurationMs = 0
 let lastSpeedHistorySampleAt = 0
 let lastProgressUiUpdateAt = 0
+
+const bandwidthUsageWidth = computed(() => {
+  const utilization = Number(averageBandwidthUtilization.value)
+  const safeUtilization = Number.isFinite(utilization) ? Math.max(0, Math.min(100, utilization)) : 0
+  return `${safeUtilization}%`
+})
 
 const speedChartPolyline = computed(() => {
   if (speedHistory.value.length < 2) return ''
@@ -180,7 +209,7 @@ const formatSize = (bytes) => {
 
 const formatDateTime = (date) => {
   if (!date) return '-'
-  return new Intl.DateTimeFormat('zh-CN', {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
     month: '2-digit',
@@ -189,7 +218,12 @@ const formatDateTime = (date) => {
     minute: '2-digit',
     second: '2-digit',
     hour12: false
-  }).format(date)
+  }).formatToParts(date).reduce((result, part) => {
+    result[part.type] = part.value
+    return result
+  }, {})
+
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
 }
 
 const formatDuration = (durationMs) => {
@@ -210,9 +244,30 @@ const formatSpeedMbps = (value) => {
   return Number.isFinite(value) && value > 0 ? value.toFixed(2) : '0.00'
 }
 
+const clampDisplaySpeedMbps = (value) => {
+  return Number.isFinite(value) && value > 0 ? Math.min(SPEED_DISPLAY_MAX_MBPS, value) : 0
+}
+
+const formatDisplaySpeedMbps = (value) => {
+  return formatSpeedMbps(clampDisplaySpeedMbps(value))
+}
+
 const formatUtilization = (speedMbps) => {
   const utilization = (speedMbps / FIXED_BANDWIDTH_MBPS) * 100
   return Number.isFinite(utilization) && utilization > 0 ? Math.min(100, utilization).toFixed(1) : '0.0'
+}
+
+const formatRemainingTime = (durationMs) => {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return '计算中'
+
+  const totalSeconds = Math.ceil(durationMs / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+
+  if (hours > 0) return `${hours}小时${minutes}分`
+  if (minutes > 0) return `${minutes}分${seconds}秒`
+  return `${seconds}秒`
 }
 
 const buildHeaders = () => {
@@ -231,9 +286,8 @@ const buildHeaders = () => {
 
 const resetTransferMetrics = () => {
   currentSpeedMbps.value = '0.00'
-  currentBandwidthUtilization.value = '0.0'
-  averageConfirmedSpeedMbps.value = '0.00'
   averageBandwidthUtilization.value = '0.0'
+  estimatedRemainingText.value = '-'
   speedHistory.value = []
   speedSamples = []
   realtimeBytesUploaded = 0
@@ -290,7 +344,6 @@ const appendSpeedHistory = (sample, force = false) => {
 
 const resetSpeedWindow = (now = performance.now()) => {
   currentSpeedMbps.value = '0.00'
-  currentBandwidthUtilization.value = '0.0'
   speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
   appendSpeedHistory({ time: now, mbps: 0 }, true)
 }
@@ -328,8 +381,23 @@ const updateAverageMetrics = () => {
     ? (realtimeBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
     : 0
 
-  averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
   averageBandwidthUtilization.value = formatUtilization(averageSpeed)
+
+  if (uploaded.value || progress.value >= 100) {
+    estimatedRemainingText.value = '已完成'
+    return
+  }
+
+  const totalBytes = file.value?.size || 0
+  const remainingBytes = Math.max(0, totalBytes - realtimeBytesUploaded)
+  if (remainingBytes <= 0) {
+    estimatedRemainingText.value = '已完成'
+  } else if (averageSpeed > 0) {
+    const remainingMs = (remainingBytes * 8) / (averageSpeed * 1000 * 1000) * 1000
+    estimatedRemainingText.value = formatRemainingTime(remainingMs)
+  } else {
+    estimatedRemainingText.value = '计算中'
+  }
 }
 
 const updateRealtimeSpeed = (bytesUploaded, now = performance.now()) => {
@@ -353,10 +421,10 @@ const updateRealtimeSpeed = (bytesUploaded, now = performance.now()) => {
     ? (realtimeBytes * 8) / elapsedSeconds / 1000 / 1000
     : 0
 
-  currentSpeedMbps.value = formatSpeedMbps(speedMbps)
-  currentBandwidthUtilization.value = formatUtilization(speedMbps)
+  const displaySpeedMbps = clampDisplaySpeedMbps(speedMbps)
+  currentSpeedMbps.value = formatSpeedMbps(displaySpeedMbps)
 
-  appendSpeedHistory({ time: now, mbps: speedMbps })
+  appendSpeedHistory({ time: now, mbps: displaySpeedMbps })
   updateAverageMetrics()
 }
 
@@ -392,15 +460,15 @@ const finishStats = () => {
     ? (statsBytes * 8) / (durationMs / 1000) / 1000 / 1000
     : 0
 
-  averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeedMbps)
   averageBandwidthUtilization.value = formatUtilization(averageSpeedMbps)
+  estimatedRemainingText.value = '已完成'
 
   uploadStats.value = {
     startedAt,
     finishedAt,
     durationText: formatDuration(durationMs),
     confirmedBytes: statsBytes,
-    averageSpeedMbps: formatSpeedMbps(averageSpeedMbps),
+    averageSpeedMbps: formatDisplaySpeedMbps(averageSpeedMbps),
     averageBandwidthUtilization: formatUtilization(averageSpeedMbps)
   }
 }
@@ -422,8 +490,8 @@ const applyServerUploadMetric = (metric) => {
   const utilization = Number.isFinite(Number(metric.bandwidth_utilization)) && Number(metric.bandwidth_utilization) > 0
     ? Math.min(100, Number(metric.bandwidth_utilization))
     : Number(formatUtilization(averageSpeed))
-  averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
   averageBandwidthUtilization.value = Number.isFinite(utilization) ? utilization.toFixed(1) : formatUtilization(averageSpeed)
+  estimatedRemainingText.value = '已完成'
 
   uploadStats.value = {
     ...uploadStats.value,
@@ -431,7 +499,7 @@ const applyServerUploadMetric = (metric) => {
     finishedAt: serverFinishedAt && !Number.isNaN(serverFinishedAt.getTime()) ? serverFinishedAt : uploadStats.value.finishedAt,
     durationText: formatDuration(durationMs),
     confirmedBytes,
-    averageSpeedMbps: formatSpeedMbps(averageSpeed),
+    averageSpeedMbps: formatDisplaySpeedMbps(averageSpeed),
     averageBandwidthUtilization: averageBandwidthUtilization.value
   }
 }
@@ -581,56 +649,94 @@ const stopUpload = async () => {
   margin-top: 20px;
 }
 
+.file-summary {
+  margin: 0 0 10px;
+  color: #303133;
+  font-size: 14px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
 .actions {
   margin-top: 15px;
 }
 
-.speed-display {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 18px;
-  margin-top: 10px;
-  color: #606266;
-  font-size: 13px;
-}
-
 .bandwidth-panel {
-  margin: 14px auto 0;
-  max-width: 760px;
+  margin: 16px auto 0;
+  max-width: 820px;
 }
 
 .metric-strip {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(190px, 1.3fr) repeat(3, minmax(0, 1fr));
   text-align: left;
-  border-top: 1px solid #ebeef5;
-  border-bottom: 1px solid #ebeef5;
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #fff;
 }
 
 .metric-item {
   min-width: 0;
-  padding: 10px 12px;
+  min-height: 74px;
+  padding: 12px 14px;
   border-right: 1px solid #ebeef5;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 
 .metric-item:last-child {
   border-right: 0;
 }
 
+.metric-primary {
+  background: #f5f9ff;
+}
+
 .metric-label {
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
   color: #909399;
   font-size: 12px;
 }
 
 .metric-item strong {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
   color: #303133;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 600;
   word-break: break-word;
+}
+
+.metric-primary strong {
+  color: #1f5fbf;
+  font-size: 24px;
+}
+
+.metric-item strong span,
+.metric-item strong em {
+  color: #606266;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.usage-meter {
+  height: 5px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: #edf2f7;
+  overflow: hidden;
+}
+
+.usage-meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #409eff;
 }
 
 .speed-chart {
@@ -676,39 +782,146 @@ const stopUpload = async () => {
   .metric-item:nth-child(2n) {
     border-right: 0;
   }
+
+  .metric-primary {
+    grid-column: 1 / -1;
+  }
+
+  .metric-primary strong {
+    font-size: 22px;
+  }
+}
+
+.result-box {
+  max-width: 820px;
+  margin: 20px auto 0;
+  padding: 18px;
+  text-align: center;
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.result-header {
+  padding-bottom: 14px;
+  border-bottom: 1px solid #ebeef5;
+}
+
+.result-status {
+  color: #1f7a4d;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.result-subtitle {
+  margin-top: 4px;
+  color: #909399;
+  font-size: 13px;
 }
 
 .code-display {
-  margin-top: 10px;
-  background: #f0f9eb;
-  padding: 15px;
-  border-radius: 8px;
-  border: 1px solid #67c23a;
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #b7ebc6;
+  border-radius: 6px;
+  background: #f6ffed;
+}
+
+.code-display span {
+  display: block;
+  margin-bottom: 8px;
+  color: #529b2e;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .code {
-  color: #67c23a;
-  font-size: 18px;
-  margin: 10px 0;
+  display: block;
+  color: #1f7a4d;
+  font-size: 30px;
+  line-height: 1.15;
+  letter-spacing: 0;
   word-break: break-all;
   font-family: monospace;
 }
 
 .stats-display {
   margin-top: 16px;
-  text-align: left;
-  background: #f4f4f5;
-  padding: 15px;
-  border-radius: 8px;
-  border: 1px solid #dcdfe6;
-}
-
-.stats-display p {
-  margin: 8px 0;
 }
 
 .stats-title {
+  color: #303133;
   font-weight: 600;
   margin-bottom: 10px;
+  text-align: center;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.stats-item {
+  min-width: 0;
+  padding: 12px;
+  border-right: 1px solid #ebeef5;
+  border-bottom: 1px solid #ebeef5;
+  background: #fafafa;
+  text-align: center;
+}
+
+.stats-item:nth-child(3n) {
+  border-right: 0;
+}
+
+.stats-item:nth-last-child(-n + 3) {
+  border-bottom: 0;
+}
+
+.stats-item span {
+  display: block;
+  margin-bottom: 6px;
+  color: #909399;
+  font-size: 12px;
+}
+
+.stats-item strong {
+  display: block;
+  color: #303133;
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .result-header {
+    display: block;
+  }
+
+  .result-subtitle {
+    margin-top: 4px;
+  }
+
+  .code {
+    font-size: 24px;
+  }
+
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stats-item,
+  .stats-item:nth-child(3n),
+  .stats-item:nth-last-child(-n + 3) {
+    border-right: 0;
+    border-bottom: 1px solid #ebeef5;
+  }
+
+  .stats-item:last-child {
+    border-bottom: 0;
+  }
 }
 </style>
