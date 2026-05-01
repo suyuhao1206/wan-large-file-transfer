@@ -1133,7 +1133,7 @@ func querySharedFiles(ctx context.Context, ownerHash string, includeAll bool) ([
 			um.finished_at AS metric_finished_at,
 			COALESCE(um.duration_ms, 0) AS upload_duration_ms,
 			COALESCE(um.average_mbps, 0) AS average_mbps,
-			COALESCE(LEAST(um.bandwidth_utilization, 100), 0) AS bandwidth_utilization,
+			COALESCE(um.bandwidth_utilization, 0) AS bandwidth_utilization,
 			COALESCE(um.bandwidth_baseline_mbps, 0) AS bandwidth_baseline_mbps
 		FROM share_codes sc
 		LEFT JOIN upload_metrics um ON um.upload_id = sc.upload_id
@@ -1741,17 +1741,7 @@ func uploadBandwidthUtilization(averageMbps float64) float64 {
 	if averageMbps <= 0 || bandwidthBaselineMbps <= 0 {
 		return 0
 	}
-	return clampUtilization(averageMbps / bandwidthBaselineMbps * 100)
-}
-
-func clampUtilization(utilization float64) float64 {
-	if utilization <= 0 {
-		return 0
-	}
-	if utilization > 100 {
-		return 100
-	}
-	return utilization
+	return averageMbps / bandwidthBaselineMbps * 100
 }
 
 func uploadMetricResponse(summary UploadMetricSummary) gin.H {
@@ -1761,7 +1751,7 @@ func uploadMetricResponse(summary UploadMetricSummary) gin.H {
 		"finished_at":             summary.FinishedAt.Format(time.RFC3339),
 		"duration_ms":             float64(summary.Duration) / float64(time.Millisecond),
 		"average_mbps":            summary.AverageMbps,
-		"bandwidth_utilization":   clampUtilization(summary.BandwidthUtilization),
+		"bandwidth_utilization":   summary.BandwidthUtilization,
 		"bandwidth_baseline_mbps": summary.BandwidthBaselineMbps,
 	}
 }
@@ -1801,7 +1791,7 @@ func persistUploadMetricInterval(uploadID string, bytes int64, startedAt time.Ti
 			END,
 			bandwidth_utilization = CASE
 				WHEN EXCLUDED.bandwidth_baseline_mbps > 0 AND EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) > 0
-				THEN LEAST(100, (((upload_metrics.bytes + EXCLUDED.bytes)::DOUBLE PRECISION * 8 / EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) / 1000000) / EXCLUDED.bandwidth_baseline_mbps * 100))
+				THEN (((upload_metrics.bytes + EXCLUDED.bytes)::DOUBLE PRECISION * 8 / EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) / 1000000) / EXCLUDED.bandwidth_baseline_mbps * 100)
 				ELSE 0
 			END,
 			bandwidth_baseline_mbps = EXCLUDED.bandwidth_baseline_mbps,
@@ -1953,7 +1943,6 @@ func getPersistedUploadMetric(ctx context.Context, uploadID string) (UploadMetri
 	summary.StartedAt = startedAt.Time
 	summary.FinishedAt = finishedAt.Time
 	summary.Duration = time.Duration(durationMs) * time.Millisecond
-	summary.BandwidthUtilization = clampUtilization(summary.BandwidthUtilization)
 	return summary, true
 }
 

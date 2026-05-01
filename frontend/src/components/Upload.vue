@@ -148,7 +148,7 @@ const estimatedRemainingText = ref('-')
 const speedHistory = ref([])
 
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
-const SPEED_WINDOW_MS = 30 * 1000
+const SPEED_WINDOW_MS = 10 * 1000
 const UI_PROGRESS_UPDATE_MS = 500
 const SPEED_HISTORY_SAMPLE_MS = 1000
 const SPEED_HISTORY_MAX_POINTS = 120
@@ -250,6 +250,11 @@ const formatDuration = (durationMs) => {
 
 const formatSpeedMbps = (value) => {
   return Number.isFinite(value) && value > 0 ? value.toFixed(2) : '0.00'
+}
+
+const calculateMbps = (bytes, durationMs) => {
+  const seconds = durationMs / 1000
+  return seconds > 0 && bytes > 0 ? (bytes * 8) / seconds / 1000 / 1000 : 0
 }
 
 const formatDisplaySpeedMbps = (value) => {
@@ -402,9 +407,8 @@ const getActiveUploadDurationMs = () => {
 
 const updateAverageMetrics = () => {
   const durationMs = getActiveUploadDurationMs()
-  const averageSpeed = durationMs > 0 && realtimeBytesUploaded > 0
-    ? (realtimeBytesUploaded * 8) / (durationMs / 1000) / 1000 / 1000
-    : 0
+  const measuredBytesUploaded = Math.max(realtimeBytesUploaded, confirmedBytesUploaded)
+  const averageSpeed = calculateMbps(measuredBytesUploaded, durationMs)
 
   averageBandwidthUtilization.value = formatDisplayUtilization(averageSpeed)
   bandwidthUsagePercent.value = getBandwidthUsagePercent(averageSpeed)
@@ -415,7 +419,7 @@ const updateAverageMetrics = () => {
   }
 
   const totalBytes = file.value?.size || 0
-  const remainingBytes = Math.max(0, totalBytes - realtimeBytesUploaded)
+  const remainingBytes = Math.max(0, totalBytes - measuredBytesUploaded)
   if (remainingBytes <= 0) {
     estimatedRemainingText.value = '已完成'
   } else if (averageSpeed > 0) {
@@ -429,7 +433,14 @@ const updateAverageMetrics = () => {
 const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistory = false) => {
   if (!Number.isFinite(bytesUploaded) || bytesUploaded < 0) return
 
-  realtimeBytesUploaded = Math.max(realtimeBytesUploaded, bytesUploaded)
+  if (bytesUploaded < realtimeBytesUploaded) {
+    realtimeBytesUploaded = bytesUploaded
+    resetSpeedWindow(now)
+    updateAverageMetrics()
+    return
+  }
+
+  realtimeBytesUploaded = bytesUploaded
   speedSamples.push({ time: now, bytes: realtimeBytesUploaded })
   speedSamples = speedSamples.filter(sample => now - sample.time <= SPEED_WINDOW_MS)
 
@@ -443,9 +454,7 @@ const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistor
   const elapsedSeconds = (last.time - first.time) / 1000
   const realtimeBytes = last.bytes - first.bytes
 
-  const speedMbps = elapsedSeconds > 0 && realtimeBytes > 0
-    ? (realtimeBytes * 8) / elapsedSeconds / 1000 / 1000
-    : 0
+  const speedMbps = calculateMbps(realtimeBytes, elapsedSeconds * 1000)
 
   const displaySpeedMbps = Number.isFinite(speedMbps) && speedMbps > 0 ? speedMbps : 0
   setDisplaySpeed(displaySpeedMbps)
@@ -466,7 +475,7 @@ const updateUploadProgress = (bytesUploaded, bytesTotal, force = false) => {
   displayBytesUploaded = Math.max(displayBytesUploaded, bytesUploaded)
   const percentage = (displayBytesUploaded / bytesTotal * 100).toFixed(2)
   progress.value = Math.min(100, Number(percentage))
-  updateRealtimeSpeed(displayBytesUploaded, now, force)
+  updateRealtimeSpeed(bytesUploaded, now, force)
 }
 
 const updateConfirmedSpeed = (chunkSize) => {
@@ -482,10 +491,11 @@ const finishStats = () => {
   const startedAt = uploadStartedAt.value || finishedAt
   const durationMs = Math.max(0, getActiveUploadDurationMs())
 
-  const statsBytes = confirmedBytesUploaded > 0 ? confirmedBytesUploaded : realtimeBytesUploaded
-  const averageSpeedMbps = durationMs > 0 && statsBytes > 0
-    ? (statsBytes * 8) / (durationMs / 1000) / 1000 / 1000
-    : 0
+  const finalFileBytes = file.value?.size || 0
+  const statsBytes = finalFileBytes > 0
+    ? finalFileBytes
+    : Math.max(confirmedBytesUploaded, realtimeBytesUploaded)
+  const averageSpeedMbps = calculateMbps(statsBytes, durationMs)
 
   averageBandwidthUtilization.value = formatDisplayUtilization(averageSpeedMbps)
   bandwidthUsagePercent.value = getBandwidthUsagePercent(averageSpeedMbps)
@@ -514,7 +524,7 @@ const applyServerUploadMetric = (metric) => {
   const serverFinishedAt = metric.finished_at ? new Date(metric.finished_at) : null
   const averageSpeed = Number.isFinite(Number(metric.average_mbps)) && Number(metric.average_mbps) > 0
     ? Number(metric.average_mbps)
-    : (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
+    : calculateMbps(confirmedBytes, durationMs)
   const utilization = Number.isFinite(Number(metric.bandwidth_utilization)) && Number(metric.bandwidth_utilization) > 0
     ? Number(metric.bandwidth_utilization)
     : Number(formatUtilization(averageSpeed))
