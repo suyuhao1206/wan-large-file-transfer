@@ -19,10 +19,9 @@
       <el-progress :percentage="progress" />
       <div class="speed-display" v-if="uploading || paused || uploaded">
         <span>实时速度：{{ currentSpeedMbps }} Mbps</span>
-        <span>固定带宽：{{ FIXED_BANDWIDTH_MBPS }} Mbps</span>
+        <span>参考带宽：{{ FIXED_BANDWIDTH_MBPS }} Mbps</span>
         <span>当前利用率：{{ currentBandwidthUtilization }}%</span>
         <span>分片大小：{{ formatSize(UPLOAD_CHUNK_SIZE) }}</span>
-        <span>并行上传：{{ PARALLEL_UPLOADS }} 路</span>
       </div>
 
       <div class="bandwidth-panel" v-if="uploading || paused || uploaded">
@@ -115,10 +114,15 @@ const speedHistory = ref([])
 
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
 const SPEED_WINDOW_MS = 10 * 1000
+const UI_PROGRESS_UPDATE_MS = 500
+const SPEED_HISTORY_FINE_SAMPLE_MS = 30 * 1000
+const SPEED_HISTORY_FINE_WINDOW_MS = 60 * 60 * 1000
+const SPEED_HISTORY_COARSE_SAMPLE_MS = 5 * 60 * 1000
+const SPEED_HISTORY_MAX_POINTS = 500
 const SPEED_CHART_WIDTH = 600
 const SPEED_CHART_HEIGHT = 120
 const FIXED_BANDWIDTH_MBPS = 100
-const PARALLEL_UPLOADS = 3
+const PARALLEL_UPLOADS = 4
 
 let upload = null
 let speedSamples = []
@@ -126,6 +130,8 @@ let realtimeBytesUploaded = 0
 let confirmedBytesUploaded = 0
 let activeUploadStartedAtMs = null
 let activeUploadDurationMs = 0
+let lastSpeedHistorySampleAt = 0
+let lastProgressUiUpdateAt = 0
 
 const speedChartPolyline = computed(() => {
   if (speedHistory.value.length < 2) return ''
@@ -175,6 +181,7 @@ const formatSize = (bytes) => {
 const formatDateTime = (date) => {
   if (!date) return '-'
   return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -205,7 +212,7 @@ const formatSpeedMbps = (value) => {
 
 const formatUtilization = (speedMbps) => {
   const utilization = (speedMbps / FIXED_BANDWIDTH_MBPS) * 100
-  return Number.isFinite(utilization) && utilization > 0 ? utilization.toFixed(1) : '0.0'
+  return Number.isFinite(utilization) && utilization > 0 ? Math.min(100, utilization).toFixed(1) : '0.0'
 }
 
 const buildHeaders = () => {
@@ -233,16 +240,59 @@ const resetTransferMetrics = () => {
   confirmedBytesUploaded = 0
   activeUploadStartedAtMs = null
   activeUploadDurationMs = 0
+  lastSpeedHistorySampleAt = 0
+  lastProgressUiUpdateAt = 0
+}
+
+const compactSpeedHistory = (history, now) => {
+  const fineCutoff = now - SPEED_HISTORY_FINE_WINDOW_MS
+  const coarseBuckets = new Map()
+  const recentSamples = []
+
+  for (const sample of history) {
+    if (!Number.isFinite(sample.time) || !Number.isFinite(sample.mbps)) {
+      continue
+    }
+
+    if (sample.time >= fineCutoff) {
+      recentSamples.push(sample)
+      continue
+    }
+
+    const bucket = Math.floor(sample.time / SPEED_HISTORY_COARSE_SAMPLE_MS)
+    const existing = coarseBuckets.get(bucket)
+    if (!existing || sample.time > existing.time) {
+      coarseBuckets.set(bucket, sample)
+    }
+  }
+
+  const compacted = [
+    ...Array.from(coarseBuckets.values()).sort((a, b) => a.time - b.time),
+    ...recentSamples
+  ]
+
+  return compacted.length > SPEED_HISTORY_MAX_POINTS
+    ? compacted.slice(compacted.length - SPEED_HISTORY_MAX_POINTS)
+    : compacted
+}
+
+const appendSpeedHistory = (sample, force = false) => {
+  if (!force && lastSpeedHistorySampleAt && sample.time - lastSpeedHistorySampleAt < SPEED_HISTORY_FINE_SAMPLE_MS) {
+    return
+  }
+
+  lastSpeedHistorySampleAt = sample.time
+  speedHistory.value = compactSpeedHistory([
+    ...speedHistory.value,
+    sample
+  ], sample.time)
 }
 
 const resetSpeedWindow = (now = performance.now()) => {
   currentSpeedMbps.value = '0.00'
   currentBandwidthUtilization.value = '0.0'
   speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
-  speedHistory.value = [
-    ...speedHistory.value,
-    { time: now, mbps: 0 }
-  ]
+  appendSpeedHistory({ time: now, mbps: 0 }, true)
 }
 
 const beginActiveUploadTiming = () => {
@@ -282,10 +332,9 @@ const updateAverageMetrics = () => {
   averageBandwidthUtilization.value = formatUtilization(averageSpeed)
 }
 
-const updateRealtimeSpeed = (bytesUploaded) => {
+const updateRealtimeSpeed = (bytesUploaded, now = performance.now()) => {
   if (!Number.isFinite(bytesUploaded) || bytesUploaded < 0) return
 
-  const now = performance.now()
   realtimeBytesUploaded = bytesUploaded
   speedSamples.push({ time: now, bytes: realtimeBytesUploaded })
   speedSamples = speedSamples.filter(sample => now - sample.time <= SPEED_WINDOW_MS)
@@ -307,11 +356,22 @@ const updateRealtimeSpeed = (bytesUploaded) => {
   currentSpeedMbps.value = formatSpeedMbps(speedMbps)
   currentBandwidthUtilization.value = formatUtilization(speedMbps)
 
-  speedHistory.value = [
-    ...speedHistory.value,
-    { time: now, mbps: speedMbps }
-  ]
+  appendSpeedHistory({ time: now, mbps: speedMbps })
   updateAverageMetrics()
+}
+
+const updateUploadProgress = (bytesUploaded, bytesTotal, force = false) => {
+  if (!Number.isFinite(bytesUploaded) || !Number.isFinite(bytesTotal) || bytesTotal <= 0) return
+
+  const now = performance.now()
+  if (!force && lastProgressUiUpdateAt && now - lastProgressUiUpdateAt < UI_PROGRESS_UPDATE_MS) {
+    return
+  }
+
+  lastProgressUiUpdateAt = now
+  const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2)
+  progress.value = Math.min(100, Number(percentage))
+  updateRealtimeSpeed(bytesUploaded, now)
 }
 
 const updateConfirmedSpeed = (chunkSize) => {
@@ -354,16 +414,25 @@ const applyServerUploadMetric = (metric) => {
     return
   }
 
-  const averageSpeed = (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
+  const serverStartedAt = metric.started_at ? new Date(metric.started_at) : null
+  const serverFinishedAt = metric.finished_at ? new Date(metric.finished_at) : null
+  const averageSpeed = Number.isFinite(Number(metric.average_mbps)) && Number(metric.average_mbps) > 0
+    ? Number(metric.average_mbps)
+    : (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
+  const utilization = Number.isFinite(Number(metric.bandwidth_utilization)) && Number(metric.bandwidth_utilization) > 0
+    ? Math.min(100, Number(metric.bandwidth_utilization))
+    : Number(formatUtilization(averageSpeed))
   averageConfirmedSpeedMbps.value = formatSpeedMbps(averageSpeed)
-  averageBandwidthUtilization.value = formatUtilization(averageSpeed)
+  averageBandwidthUtilization.value = Number.isFinite(utilization) ? utilization.toFixed(1) : formatUtilization(averageSpeed)
 
   uploadStats.value = {
     ...uploadStats.value,
+    startedAt: serverStartedAt && !Number.isNaN(serverStartedAt.getTime()) ? serverStartedAt : uploadStats.value.startedAt,
+    finishedAt: serverFinishedAt && !Number.isNaN(serverFinishedAt.getTime()) ? serverFinishedAt : uploadStats.value.finishedAt,
     durationText: formatDuration(durationMs),
     confirmedBytes,
     averageSpeedMbps: formatSpeedMbps(averageSpeed),
-    averageBandwidthUtilization: formatUtilization(averageSpeed)
+    averageBandwidthUtilization: averageBandwidthUtilization.value
   }
 }
 
@@ -417,14 +486,14 @@ const startUpload = () => {
       uploading.value = false
     },
     onProgress: (bytesUploaded, bytesTotal) => {
-      const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2)
-      progress.value = Number(percentage)
-      updateRealtimeSpeed(bytesUploaded)
+      updateUploadProgress(bytesUploaded, bytesTotal)
     },
     onChunkComplete: (chunkSize) => {
       updateConfirmedSpeed(chunkSize)
     },
     onSuccess: async () => {
+      const totalBytes = file.value?.size || realtimeBytesUploaded
+      updateUploadProgress(totalBytes, totalBytes, true)
       uploading.value = false
       uploaded.value = true
       finishStats()

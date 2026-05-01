@@ -641,7 +641,7 @@ const saveGeneratedKey = () => {
 const formatDate = (dateStr) => {
   if (!dateStr) return ''
   const date = new Date(dateStr)
-  return date.toLocaleString('zh-CN')
+  return date.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
 }
 
 // Watch settings tab change

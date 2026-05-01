@@ -4,6 +4,7 @@ services:
     command: >
       /bin/sh -c "envsubst '$$NGINX_SERVER_NAME $$NGINX_SSL_CERTIFICATE $$NGINX_SSL_CERTIFICATE_KEY $$BACKEND_PORT $$S3_BUCKET' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     environment:
+      - TZ=${APP_TIMEZONE:-Asia/Shanghai}
       - NGINX_SERVER_NAME=${NGINX_SERVER_NAME:?NGINX_SERVER_NAME is required}
       - NGINX_SSL_CERTIFICATE=${NGINX_SSL_CERTIFICATE:?NGINX_SSL_CERTIFICATE is required}
       - NGINX_SSL_CERTIFICATE_KEY=${NGINX_SSL_CERTIFICATE_KEY:?NGINX_SSL_CERTIFICATE_KEY is required}
@@ -27,6 +28,8 @@ services:
       dockerfile: Dockerfile
     expose:
       - "80"
+    environment:
+      - TZ=${APP_TIMEZONE:-Asia/Shanghai}
     depends_on:
       - backend
     networks:
@@ -39,6 +42,7 @@ services:
     expose:
       - "${BACKEND_PORT:-8080}"
     environment:
+      - TZ=${APP_TIMEZONE:-Asia/Shanghai}
       - DB_HOST=${DB_HOST:-postgres}
       - DB_USER=${POSTGRES_USER:?POSTGRES_USER is required}
       - DB_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
@@ -52,6 +56,7 @@ services:
       - TUSD_UPLOAD_DIR=${TUSD_UPLOAD_DIR:-/data/uploads}
       - SHARE_CODE_TTL_MINUTES=${SHARE_CODE_TTL_MINUTES:-120}
       - SHARE_CODE_MAX_DOWNLOADS=${SHARE_CODE_MAX_DOWNLOADS:-10000}
+      - BANDWIDTH_BASELINE_MBPS=${BANDWIDTH_BASELINE_MBPS:-100}
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
       - ENABLE_DEBUG_ENDPOINTS=${ENABLE_DEBUG_ENDPOINTS:-false}
       - PORT=${BACKEND_PORT:-8080}
@@ -67,7 +72,9 @@ services:
 
   postgres:
     image: postgres:14-alpine
+    command: ["postgres", "-c", "timezone=${APP_TIMEZONE:-Asia/Shanghai}"]
     environment:
+      - TZ=${APP_TIMEZONE:-Asia/Shanghai}
       - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER is required}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       - POSTGRES_DB=${POSTGRES_DB:?POSTGRES_DB is required}
@@ -88,6 +95,7 @@ services:
       - "${MINIO_API_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
+      - TZ=${APP_TIMEZONE:-Asia/Shanghai}
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
     volumes:

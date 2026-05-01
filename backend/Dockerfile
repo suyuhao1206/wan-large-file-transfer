@@ -17,6 +17,8 @@ FROM alpine:3.22
 
 WORKDIR /app
 
+RUN apk add --no-cache tzdata
+
 COPY --from=builder /app/server .
 
 EXPOSE 8080

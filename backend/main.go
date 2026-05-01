@@ -52,6 +52,7 @@ var (
     db              *sql.DB
     ttlMinutes      int
 	maxDownloads    int
+	bandwidthBaselineMbps float64
 	codeRegex       = regexp.MustCompile(`^[A-Za-z0-9._-]{4,128}$`)
 	apiKey          string // Legacy API key for authentication (from env)
 	adminKey        string // Admin key for managing API keys (optional)
@@ -70,6 +71,16 @@ type UploadMetric struct {
 type UploadMetricInterval struct {
 	Start time.Time
 	End   time.Time
+}
+
+type UploadMetricSummary struct {
+	Bytes                int64
+	StartedAt            time.Time
+	FinishedAt           time.Time
+	Duration             time.Duration
+	AverageMbps          float64
+	BandwidthUtilization float64
+	BandwidthBaselineMbps float64
 }
 
 func shareCodeExpiresAt() sql.NullTime {
@@ -100,6 +111,10 @@ func main() {
     if n, err := strconv.Atoi(ttlMinutesStr); err == nil && n >= 0 { ttlMinutes = n }
     maxDownloads = 10000
     if n, err := strconv.Atoi(maxDownloadsStr); err == nil && n > 0 { maxDownloads = n }
+	bandwidthBaselineMbps = 100
+	if n, err := strconv.ParseFloat(os.Getenv("BANDWIDTH_BASELINE_MBPS"), 64); err == nil && n > 0 {
+		bandwidthBaselineMbps = n
+	}
     corsOrigins := os.Getenv("CORS_ORIGINS")
     enableDebug := strings.ToLower(os.Getenv("ENABLE_DEBUG_ENDPOINTS")) == "true"
     apiKey = os.Getenv("API_KEY") // Legacy API key from environment (optional)
@@ -125,6 +140,26 @@ func main() {
                 _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_share_codes_upload ON share_codes(upload_id)`)
                 _, _ = db.Exec(`ALTER TABLE share_codes ADD COLUMN IF NOT EXISTS owner_key_hash TEXT`)
                 _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_share_codes_owner ON share_codes(owner_key_hash)`)
+                _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS upload_metric_intervals (
+                    id BIGSERIAL PRIMARY KEY,
+                    upload_id TEXT NOT NULL,
+                    bytes BIGINT NOT NULL,
+                    started_at TIMESTAMPTZ NOT NULL,
+                    finished_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )`)
+                _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_upload_metric_intervals_upload ON upload_metric_intervals(upload_id)`)
+                _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS upload_metrics (
+                    upload_id TEXT PRIMARY KEY,
+                    bytes BIGINT NOT NULL DEFAULT 0,
+                    started_at TIMESTAMPTZ,
+                    finished_at TIMESTAMPTZ,
+                    duration_ms BIGINT NOT NULL DEFAULT 0,
+                    average_mbps DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    bandwidth_utilization DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    bandwidth_baseline_mbps DOUBLE PRECISION NOT NULL DEFAULT 100,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )`)
                 if ttlMinutes <= 0 {
                     if _, err := db.Exec(`UPDATE share_codes SET expires_at = NULL WHERE expires_at IS NOT NULL`); err != nil {
                         log.Printf("Failed to disable share code expiration: %v", err)
@@ -916,14 +951,21 @@ type APIKeyResponse struct {
 }
 
 type AdminFileRecord struct {
-	Code         string     `json:"code"`
-	UploadID     string     `json:"upload_id"`
-	Filename     string     `json:"filename"`
-	CreatedAt    time.Time  `json:"created_at"`
-	ExpiresAt    *time.Time `json:"expires_at"`
-	Downloads    int        `json:"downloads"`
-	MaxDownloads int        `json:"max_downloads"`
-	Status       string     `json:"status"`
+	Code                  string     `json:"code"`
+	UploadID              string     `json:"upload_id"`
+	Filename              string     `json:"filename"`
+	CreatedAt             time.Time  `json:"created_at"`
+	ExpiresAt             *time.Time `json:"expires_at"`
+	Downloads             int        `json:"downloads"`
+	MaxDownloads          int        `json:"max_downloads"`
+	Status                string     `json:"status"`
+	UploadBytes           int64      `json:"upload_bytes"`
+	MetricStartedAt       *time.Time `json:"metric_started_at"`
+	MetricFinishedAt      *time.Time `json:"metric_finished_at"`
+	UploadDurationMs      int64      `json:"upload_duration_ms"`
+	AverageMbps           float64    `json:"average_mbps"`
+	BandwidthUtilization  float64    `json:"bandwidth_utilization"`
+	BandwidthBaselineMbps float64    `json:"bandwidth_baseline_mbps"`
 }
 
 func createAPIKey(c *gin.Context) {
@@ -1075,20 +1117,28 @@ func querySharedFiles(ctx context.Context, ownerHash string, includeAll bool) ([
 	args := []interface{}{}
 	whereClause := ""
 	if !includeAll {
-		whereClause = "WHERE owner_key_hash = $1"
+		whereClause = "WHERE sc.owner_key_hash = $1"
 		args = append(args, ownerHash)
 	}
 
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT code, upload_id, filename, created_at, expires_at, downloads, max_downloads,
+		SELECT sc.code, sc.upload_id, sc.filename, sc.created_at, sc.expires_at, sc.downloads, sc.max_downloads,
 			CASE
-				WHEN expires_at IS NOT NULL AND expires_at < NOW() THEN 'expired'
-				WHEN max_downloads > 0 AND downloads >= max_downloads THEN 'download_limit'
+				WHEN sc.expires_at IS NOT NULL AND sc.expires_at < NOW() THEN 'expired'
+				WHEN sc.max_downloads > 0 AND sc.downloads >= sc.max_downloads THEN 'download_limit'
 				ELSE 'active'
-			END AS status
-		FROM share_codes
+			END AS status,
+			COALESCE(um.bytes, 0) AS upload_bytes,
+			um.started_at AS metric_started_at,
+			um.finished_at AS metric_finished_at,
+			COALESCE(um.duration_ms, 0) AS upload_duration_ms,
+			COALESCE(um.average_mbps, 0) AS average_mbps,
+			COALESCE(LEAST(um.bandwidth_utilization, 100), 0) AS bandwidth_utilization,
+			COALESCE(um.bandwidth_baseline_mbps, 0) AS bandwidth_baseline_mbps
+		FROM share_codes sc
+		LEFT JOIN upload_metrics um ON um.upload_id = sc.upload_id
 		%s
-		ORDER BY created_at DESC
+		ORDER BY sc.created_at DESC
 		LIMIT 500
 	`, whereClause), args...)
 	if err != nil {
@@ -1100,6 +1150,8 @@ func querySharedFiles(ctx context.Context, ownerHash string, includeAll bool) ([
 	for rows.Next() {
 		var file AdminFileRecord
 		var expiresAt sql.NullTime
+		var metricStartedAt sql.NullTime
+		var metricFinishedAt sql.NullTime
 
 		err := rows.Scan(
 			&file.Code,
@@ -1110,6 +1162,13 @@ func querySharedFiles(ctx context.Context, ownerHash string, includeAll bool) ([
 			&file.Downloads,
 			&file.MaxDownloads,
 			&file.Status,
+			&file.UploadBytes,
+			&metricStartedAt,
+			&metricFinishedAt,
+			&file.UploadDurationMs,
+			&file.AverageMbps,
+			&file.BandwidthUtilization,
+			&file.BandwidthBaselineMbps,
 		)
 		if err != nil {
 			log.Printf("Failed to scan shared file row: %v", err)
@@ -1119,6 +1178,14 @@ func querySharedFiles(ctx context.Context, ownerHash string, includeAll bool) ([
 		if expiresAt.Valid {
 			exp := expiresAt.Time
 			file.ExpiresAt = &exp
+		}
+		if metricStartedAt.Valid {
+			startedAt := metricStartedAt.Time
+			file.MetricStartedAt = &startedAt
+		}
+		if metricFinishedAt.Valid {
+			finishedAt := metricFinishedAt.Time
+			file.MetricFinishedAt = &finishedAt
 		}
 
 		files = append(files, file)
@@ -1495,6 +1562,8 @@ func recordUploadMetric(uploadID string, bytes int64, startedAt time.Time, finis
 	metric.Intervals = append(metric.Intervals, UploadMetricInterval{Start: startedAt, End: finishedAt})
 	uploadMetrics[uploadID] = metric
 	metricsMu.Unlock()
+
+	persistUploadMetricInterval(uploadID, bytes, startedAt, finishedAt)
 }
 
 func aggregateUploadMetrics(finalUploadID string, partialUploadIDs []string) {
@@ -1505,6 +1574,7 @@ func aggregateUploadMetrics(finalUploadID string, partialUploadIDs []string) {
 	metricsMu.Lock()
 	finalMetric := uploadMetrics[finalUploadID]
 	for _, partialUploadID := range partialUploadIDs {
+		partialUploadID = normalizeUploadID(partialUploadID)
 		if partialUploadID == "" || partialUploadID == finalUploadID {
 			continue
 		}
@@ -1520,6 +1590,8 @@ func aggregateUploadMetrics(finalUploadID string, partialUploadIDs []string) {
 	}
 	uploadMetrics[finalUploadID] = finalMetric
 	metricsMu.Unlock()
+
+	persistFinalUploadMetric(finalUploadID, partialUploadIDs, finalMetric)
 }
 
 func clearUploadRuntimeState(uploadID string) {
@@ -1614,15 +1686,290 @@ func uploadMetricDuration(metric UploadMetric) time.Duration {
 	return total
 }
 
+func summarizeUploadMetric(metric UploadMetric) (UploadMetricSummary, bool) {
+	if metric.Bytes <= 0 || len(metric.Intervals) == 0 {
+		return UploadMetricSummary{}, false
+	}
+
+	validIntervals := make([]UploadMetricInterval, 0, len(metric.Intervals))
+	for _, interval := range metric.Intervals {
+		if interval.End.After(interval.Start) {
+			validIntervals = append(validIntervals, interval)
+		}
+	}
+	if len(validIntervals) == 0 {
+		return UploadMetricSummary{}, false
+	}
+
+	startedAt := validIntervals[0].Start
+	finishedAt := validIntervals[0].End
+	for _, interval := range validIntervals[1:] {
+		if interval.Start.Before(startedAt) {
+			startedAt = interval.Start
+		}
+		if interval.End.After(finishedAt) {
+			finishedAt = interval.End
+		}
+	}
+
+	metric.Intervals = validIntervals
+	duration := uploadMetricDuration(metric)
+	if duration <= 0 {
+		return UploadMetricSummary{}, false
+	}
+
+	averageMbps := averageUploadMbps(metric.Bytes, duration)
+	return UploadMetricSummary{
+		Bytes:                metric.Bytes,
+		StartedAt:            startedAt,
+		FinishedAt:           finishedAt,
+		Duration:             duration,
+		AverageMbps:          averageMbps,
+		BandwidthUtilization: uploadBandwidthUtilization(averageMbps),
+		BandwidthBaselineMbps: bandwidthBaselineMbps,
+	}, true
+}
+
+func averageUploadMbps(bytes int64, duration time.Duration) float64 {
+	if bytes <= 0 || duration <= 0 {
+		return 0
+	}
+	return float64(bytes) * 8 / duration.Seconds() / 1000 / 1000
+}
+
+func uploadBandwidthUtilization(averageMbps float64) float64 {
+	if averageMbps <= 0 || bandwidthBaselineMbps <= 0 {
+		return 0
+	}
+	return clampUtilization(averageMbps / bandwidthBaselineMbps * 100)
+}
+
+func clampUtilization(utilization float64) float64 {
+	if utilization <= 0 {
+		return 0
+	}
+	if utilization > 100 {
+		return 100
+	}
+	return utilization
+}
+
+func uploadMetricResponse(summary UploadMetricSummary) gin.H {
+	return gin.H{
+		"bytes":                   summary.Bytes,
+		"started_at":              summary.StartedAt.Format(time.RFC3339),
+		"finished_at":             summary.FinishedAt.Format(time.RFC3339),
+		"duration_ms":             float64(summary.Duration) / float64(time.Millisecond),
+		"average_mbps":            summary.AverageMbps,
+		"bandwidth_utilization":   clampUtilization(summary.BandwidthUtilization),
+		"bandwidth_baseline_mbps": summary.BandwidthBaselineMbps,
+	}
+}
+
+func persistUploadMetricInterval(uploadID string, bytes int64, startedAt time.Time, finishedAt time.Time) {
+	if db == nil || uploadID == "" || bytes <= 0 || !finishedAt.After(startedAt) {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO upload_metric_intervals(upload_id, bytes, started_at, finished_at)
+		VALUES($1, $2, $3, $4)
+	`, uploadID, bytes, startedAt, finishedAt)
+	if err != nil {
+		log.Printf("Failed to persist upload metric interval for %s: %v", uploadID, err)
+		return
+	}
+
+	duration := finishedAt.Sub(startedAt)
+	averageMbps := averageUploadMbps(bytes, duration)
+	durationMs := duration.Milliseconds()
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO upload_metrics(upload_id, bytes, started_at, finished_at, duration_ms, average_mbps, bandwidth_utilization, bandwidth_baseline_mbps, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		ON CONFLICT (upload_id) DO UPDATE SET
+			bytes = upload_metrics.bytes + EXCLUDED.bytes,
+			started_at = LEAST(upload_metrics.started_at, EXCLUDED.started_at),
+			finished_at = GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at),
+			duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) * 1000)::BIGINT),
+			average_mbps = CASE
+				WHEN EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) > 0
+				THEN ((upload_metrics.bytes + EXCLUDED.bytes)::DOUBLE PRECISION * 8 / EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) / 1000000)
+				ELSE 0
+			END,
+			bandwidth_utilization = CASE
+				WHEN EXCLUDED.bandwidth_baseline_mbps > 0 AND EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) > 0
+				THEN LEAST(100, (((upload_metrics.bytes + EXCLUDED.bytes)::DOUBLE PRECISION * 8 / EXTRACT(EPOCH FROM (GREATEST(upload_metrics.finished_at, EXCLUDED.finished_at) - LEAST(upload_metrics.started_at, EXCLUDED.started_at))) / 1000000) / EXCLUDED.bandwidth_baseline_mbps * 100))
+				ELSE 0
+			END,
+			bandwidth_baseline_mbps = EXCLUDED.bandwidth_baseline_mbps,
+			updated_at = NOW()
+	`, uploadID, bytes, startedAt, finishedAt, durationMs, averageMbps, uploadBandwidthUtilization(averageMbps), bandwidthBaselineMbps)
+	if err != nil {
+		log.Printf("Failed to persist upload metric summary for %s: %v", uploadID, err)
+	}
+}
+
+func persistUploadMetricSummary(ctx context.Context, uploadID string, summary UploadMetricSummary) error {
+	if db == nil || uploadID == "" || summary.Bytes <= 0 || summary.Duration <= 0 {
+		return nil
+	}
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO upload_metrics(upload_id, bytes, started_at, finished_at, duration_ms, average_mbps, bandwidth_utilization, bandwidth_baseline_mbps, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		ON CONFLICT (upload_id) DO UPDATE SET
+			bytes = EXCLUDED.bytes,
+			started_at = EXCLUDED.started_at,
+			finished_at = EXCLUDED.finished_at,
+			duration_ms = EXCLUDED.duration_ms,
+			average_mbps = EXCLUDED.average_mbps,
+			bandwidth_utilization = EXCLUDED.bandwidth_utilization,
+			bandwidth_baseline_mbps = EXCLUDED.bandwidth_baseline_mbps,
+			updated_at = NOW()
+	`, uploadID, summary.Bytes, summary.StartedAt, summary.FinishedAt, summary.Duration.Milliseconds(), summary.AverageMbps, summary.BandwidthUtilization, summary.BandwidthBaselineMbps)
+	return err
+}
+
+func persistFinalUploadMetric(finalUploadID string, partialUploadIDs []string, fallbackMetric UploadMetric) {
+	if db == nil || finalUploadID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if metric, exists := loadUploadMetricFromIntervals(ctx, partialUploadIDs); exists {
+		if summary, ok := summarizeUploadMetric(metric); ok {
+			if err := persistUploadMetricSummary(ctx, finalUploadID, summary); err != nil {
+				log.Printf("Failed to persist final upload metric for %s: %v", finalUploadID, err)
+			}
+			return
+		}
+	}
+
+	if summary, ok := summarizeUploadMetric(fallbackMetric); ok {
+		if err := persistUploadMetricSummary(ctx, finalUploadID, summary); err != nil {
+			log.Printf("Failed to persist final upload metric for %s: %v", finalUploadID, err)
+		}
+	}
+}
+
+func loadUploadMetricFromIntervals(ctx context.Context, uploadIDs []string) (UploadMetric, bool) {
+	if db == nil || len(uploadIDs) == 0 {
+		return UploadMetric{}, false
+	}
+
+	seen := make(map[string]bool)
+	ids := make([]string, 0, len(uploadIDs))
+	for _, uploadID := range uploadIDs {
+		uploadID = normalizeUploadID(uploadID)
+		if uploadID == "" || seen[uploadID] {
+			continue
+		}
+		seen[uploadID] = true
+		ids = append(ids, uploadID)
+	}
+	if len(ids) == 0 {
+		return UploadMetric{}, false
+	}
+
+	placeholders := make([]string, 0, len(ids))
+	args := make([]interface{}, 0, len(ids))
+	for i, uploadID := range ids {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+		args = append(args, uploadID)
+	}
+
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT bytes, started_at, finished_at
+		FROM upload_metric_intervals
+		WHERE upload_id IN (%s)
+		ORDER BY started_at
+	`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		log.Printf("Failed to load upload metric intervals: %v", err)
+		return UploadMetric{}, false
+	}
+	defer rows.Close()
+
+	var metric UploadMetric
+	for rows.Next() {
+		var bytes int64
+		var startedAt time.Time
+		var finishedAt time.Time
+		if err := rows.Scan(&bytes, &startedAt, &finishedAt); err != nil {
+			log.Printf("Failed to scan upload metric interval: %v", err)
+			continue
+		}
+		if bytes <= 0 || !finishedAt.After(startedAt) {
+			continue
+		}
+		metric.Bytes += bytes
+		metric.Intervals = append(metric.Intervals, UploadMetricInterval{Start: startedAt, End: finishedAt})
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Failed to iterate upload metric intervals: %v", err)
+		return UploadMetric{}, false
+	}
+
+	return metric, metric.Bytes > 0 && len(metric.Intervals) > 0
+}
+
+func getPersistedUploadMetric(ctx context.Context, uploadID string) (UploadMetricSummary, bool) {
+	if db == nil || uploadID == "" {
+		return UploadMetricSummary{}, false
+	}
+
+	var summary UploadMetricSummary
+	var startedAt sql.NullTime
+	var finishedAt sql.NullTime
+	var durationMs int64
+	err := db.QueryRowContext(ctx, `
+		SELECT bytes, started_at, finished_at, duration_ms, average_mbps, bandwidth_utilization, bandwidth_baseline_mbps
+		FROM upload_metrics
+		WHERE upload_id = $1
+	`, uploadID).Scan(
+		&summary.Bytes,
+		&startedAt,
+		&finishedAt,
+		&durationMs,
+		&summary.AverageMbps,
+		&summary.BandwidthUtilization,
+		&summary.BandwidthBaselineMbps,
+	)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			log.Printf("Failed to load upload metric for %s: %v", uploadID, err)
+		}
+		return UploadMetricSummary{}, false
+	}
+	if summary.Bytes <= 0 || !startedAt.Valid || !finishedAt.Valid || durationMs <= 0 {
+		return UploadMetricSummary{}, false
+	}
+
+	summary.StartedAt = startedAt.Time
+	summary.FinishedAt = finishedAt.Time
+	summary.Duration = time.Duration(durationMs) * time.Millisecond
+	summary.BandwidthUtilization = clampUtilization(summary.BandwidthUtilization)
+	return summary, true
+}
+
 func shareCodeResponse(uploadID string, code string, filename string) gin.H {
 	response := gin.H{"code": code, "filename": filename}
 	if metric, exists := getUploadMetric(uploadID); exists {
-		duration := uploadMetricDuration(metric)
-		response["upload_metric"] = gin.H{
-			"bytes":        metric.Bytes,
-			"duration_ms":  float64(duration) / float64(time.Millisecond),
-			"average_mbps": float64(metric.Bytes) * 8 / duration.Seconds() / 1000 / 1000,
+		if summary, ok := summarizeUploadMetric(metric); ok {
+			response["upload_metric"] = uploadMetricResponse(summary)
+			return response
 		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if summary, exists := getPersistedUploadMetric(ctx, uploadID); exists {
+		response["upload_metric"] = uploadMetricResponse(summary)
 	}
 
 	return response
@@ -1645,6 +1992,13 @@ func uploadIDFromLocation(location string) string {
 
 	parts := strings.Split(path, "/")
 	return parts[len(parts)-1]
+}
+
+func normalizeUploadID(value string) string {
+	if uploadID := uploadIDFromLocation(value); uploadID != "" {
+		return uploadID
+	}
+	return value
 }
 
 func rememberUploadOwner(uploadID string, ownerHash string) {
