@@ -22,7 +22,7 @@
         <div class="metric-strip">
           <div class="metric-item metric-primary">
             <span class="metric-label">上传速率</span>
-            <strong><span v-if="currentSpeedPrefix">{{ currentSpeedPrefix }}</span>{{ currentSpeedText }}<em v-if="showCurrentSpeedUnit">Mbps</em></strong>
+            <strong>{{ currentSpeedText }}<em>Mbps</em></strong>
           </div>
           <div class="metric-item metric-usage">
             <span class="metric-label">带宽占用</span>
@@ -142,8 +142,6 @@ const shareCode = ref('')
 const uploadStats = ref(null)
 const uploadStartedAt = ref(null)
 const currentSpeedText = ref('0.00')
-const currentSpeedPrefix = ref('约')
-const showCurrentSpeedUnit = ref(true)
 const averageBandwidthUtilization = ref('0.0%')
 const bandwidthUsagePercent = ref(0)
 const estimatedRemainingText = ref('-')
@@ -155,9 +153,6 @@ const UI_PROGRESS_UPDATE_MS = 500
 const SPEED_HISTORY_SAMPLE_MS = 1000
 const SPEED_HISTORY_MAX_POINTS = 120
 const FIXED_BANDWIDTH_MBPS = 100
-const SPEED_DISPLAY_MAX_MBPS = FIXED_BANDWIDTH_MBPS
-const FULL_SPEED_DISPLAY_THRESHOLD_MBPS = 98
-const SATURATED_UTILIZATION_THRESHOLD = 95
 const PARALLEL_UPLOADS = 4
 
 let upload = null
@@ -257,17 +252,13 @@ const formatSpeedMbps = (value) => {
   return Number.isFinite(value) && value > 0 ? value.toFixed(2) : '0.00'
 }
 
-const clampDisplaySpeedMbps = (value) => {
-  return Number.isFinite(value) && value > 0 ? Math.min(SPEED_DISPLAY_MAX_MBPS, value) : 0
-}
-
 const formatDisplaySpeedMbps = (value) => {
-  return formatSpeedMbps(clampDisplaySpeedMbps(value))
+  return formatSpeedMbps(value)
 }
 
 const getUtilizationValue = (speedMbps) => {
   const utilization = (speedMbps / FIXED_BANDWIDTH_MBPS) * 100
-  return Number.isFinite(utilization) && utilization > 0 ? Math.min(100, utilization) : 0
+  return Number.isFinite(utilization) && utilization > 0 ? utilization : 0
 }
 
 const formatUtilization = (speedMbps) => {
@@ -275,27 +266,16 @@ const formatUtilization = (speedMbps) => {
 }
 
 const getBandwidthUsagePercent = (speedMbps) => {
-  const utilization = getUtilizationValue(speedMbps)
-  return utilization >= SATURATED_UTILIZATION_THRESHOLD ? 100 : utilization
+  return Math.min(100, getUtilizationValue(speedMbps))
 }
 
 const setDisplaySpeed = (speedMbps) => {
-  if (Number.isFinite(speedMbps) && speedMbps >= FULL_SPEED_DISPLAY_THRESHOLD_MBPS) {
-    currentSpeedPrefix.value = ''
-    currentSpeedText.value = '接近满速'
-    showCurrentSpeedUnit.value = false
-    return
-  }
-
-  currentSpeedPrefix.value = '约'
   currentSpeedText.value = formatSpeedMbps(speedMbps)
-  showCurrentSpeedUnit.value = true
 }
 
 const formatDisplayUtilization = (speedMbps) => {
   const utilization = getUtilizationValue(speedMbps)
   if (utilization <= 0) return '0.0%'
-  if (utilization >= SATURATED_UTILIZATION_THRESHOLD) return '接近满载'
   return `${utilization.toFixed(1)}%`
 }
 
@@ -353,8 +333,6 @@ const copyShareCode = async () => {
 
 const resetTransferMetrics = () => {
   currentSpeedText.value = '0.00'
-  currentSpeedPrefix.value = '约'
-  showCurrentSpeedUnit.value = true
   averageBandwidthUtilization.value = '0.0%'
   bandwidthUsagePercent.value = 0
   estimatedRemainingText.value = '-'
@@ -391,8 +369,6 @@ const appendSpeedHistory = (sample, force = false) => {
 
 const resetSpeedWindow = (now = performance.now()) => {
   currentSpeedText.value = '0.00'
-  currentSpeedPrefix.value = '约'
-  showCurrentSpeedUnit.value = true
   speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
   appendSpeedHistory({ time: now, mbps: 0 }, true)
 }
@@ -471,7 +447,7 @@ const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistor
     ? (realtimeBytes * 8) / elapsedSeconds / 1000 / 1000
     : 0
 
-  const displaySpeedMbps = clampDisplaySpeedMbps(speedMbps)
+  const displaySpeedMbps = Number.isFinite(speedMbps) && speedMbps > 0 ? speedMbps : 0
   setDisplaySpeed(displaySpeedMbps)
 
   appendSpeedHistory({ time: now, mbps: displaySpeedMbps }, forceHistory || speedHistory.value.length <= 1)
@@ -540,15 +516,11 @@ const applyServerUploadMetric = (metric) => {
     ? Number(metric.average_mbps)
     : (confirmedBytes * 8) / (durationMs / 1000) / 1000 / 1000
   const utilization = Number.isFinite(Number(metric.bandwidth_utilization)) && Number(metric.bandwidth_utilization) > 0
-    ? Math.min(100, Number(metric.bandwidth_utilization))
+    ? Number(metric.bandwidth_utilization)
     : Number(formatUtilization(averageSpeed))
-  const utilizationValue = Number.isFinite(utilization) ? Math.min(100, utilization) : Number(formatUtilization(averageSpeed))
-  averageBandwidthUtilization.value = utilizationValue >= SATURATED_UTILIZATION_THRESHOLD
-    ? '接近满载'
-    : `${utilizationValue.toFixed(1)}%`
-  bandwidthUsagePercent.value = utilizationValue >= SATURATED_UTILIZATION_THRESHOLD
-    ? 100
-    : utilizationValue
+  const utilizationValue = Number.isFinite(utilization) ? utilization : Number(formatUtilization(averageSpeed))
+  averageBandwidthUtilization.value = `${utilizationValue.toFixed(1)}%`
+  bandwidthUsagePercent.value = Math.min(100, utilizationValue)
   estimatedRemainingText.value = '已完成'
 
   uploadStats.value = {
