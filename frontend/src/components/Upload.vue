@@ -150,6 +150,7 @@ const speedHistory = ref([])
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
 const SPEED_WINDOW_MS = 10 * 1000
 const MIN_SPEED_SAMPLE_DURATION_MS = 1000
+const RESUME_SPEED_SETTLE_MS = 3000
 const UI_PROGRESS_UPDATE_MS = 500
 const SPEED_HISTORY_SAMPLE_MS = 1000
 const SPEED_HISTORY_MAX_POINTS = 120
@@ -166,6 +167,7 @@ let activeUploadDurationMs = 0
 let lastSpeedHistorySampleAt = 0
 let lastProgressUiUpdateAt = 0
 let shouldRebaseSpeedWindow = false
+let speedSettlingUntilMs = 0
 
 const bandwidthUsageWidth = computed(() => {
   const safeUtilization = Number.isFinite(bandwidthUsagePercent.value)
@@ -353,6 +355,7 @@ const resetTransferMetrics = () => {
   lastSpeedHistorySampleAt = 0
   lastProgressUiUpdateAt = 0
   shouldRebaseSpeedWindow = false
+  speedSettlingUntilMs = 0
 }
 
 const appendSpeedHistory = (sample, force = false) => {
@@ -375,14 +378,23 @@ const appendSpeedHistory = (sample, force = false) => {
     : nextHistory
 }
 
-const resetSpeedWindow = (now = performance.now(), waitForProgressBaseline = false) => {
-  currentSpeedText.value = '0.00'
-  speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
-  shouldRebaseSpeedWindow = waitForProgressBaseline
-  appendSpeedHistory({ time: now, mbps: 0 }, true)
+const isSpeedSettling = (now = performance.now()) => {
+  return speedSettlingUntilMs > 0 && now < speedSettlingUntilMs
 }
 
-const beginActiveUploadTiming = () => {
+const rebaseSpeedWindow = (bytesUploaded = realtimeBytesUploaded, now = performance.now(), forceHistory = false) => {
+  realtimeBytesUploaded = bytesUploaded
+  currentSpeedText.value = '0.00'
+  speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
+  appendSpeedHistory({ time: now, mbps: 0 }, forceHistory)
+}
+
+const resetSpeedWindow = (now = performance.now(), waitForProgressBaseline = false) => {
+  rebaseSpeedWindow(realtimeBytesUploaded, now, true)
+  shouldRebaseSpeedWindow = waitForProgressBaseline
+}
+
+const beginActiveUploadTiming = (settleSpeed = false) => {
   const now = performance.now()
 
   if (!uploadStartedAt.value) {
@@ -393,10 +405,13 @@ const beginActiveUploadTiming = () => {
     activeUploadStartedAtMs = now
   }
 
+  speedSettlingUntilMs = settleSpeed ? now + RESUME_SPEED_SETTLE_MS : 0
   resetSpeedWindow(now, true)
 }
 
 const stopActiveUploadTiming = () => {
+  speedSettlingUntilMs = 0
+
   if (activeUploadStartedAtMs === null) return
 
   activeUploadDurationMs += performance.now() - activeUploadStartedAtMs
@@ -437,10 +452,19 @@ const updateAverageMetrics = () => {
 const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistory = false) => {
   if (!Number.isFinite(bytesUploaded) || bytesUploaded < 0) return
 
-  if (shouldRebaseSpeedWindow || bytesUploaded < realtimeBytesUploaded) {
+  const settling = isSpeedSettling(now)
+  if (settling || shouldRebaseSpeedWindow || bytesUploaded < realtimeBytesUploaded) {
     shouldRebaseSpeedWindow = false
-    realtimeBytesUploaded = bytesUploaded
-    resetSpeedWindow(now)
+    rebaseSpeedWindow(bytesUploaded, now, !settling)
+    if (!settling) {
+      updateAverageMetrics()
+    }
+    return
+  }
+
+  if (speedSettlingUntilMs > 0) {
+    speedSettlingUntilMs = 0
+    rebaseSpeedWindow(bytesUploaded, now, true)
     updateAverageMetrics()
     return
   }
@@ -478,7 +502,8 @@ const updateUploadProgress = (bytesUploaded, bytesTotal, force = false) => {
   if (!Number.isFinite(bytesUploaded) || !Number.isFinite(bytesTotal) || bytesTotal <= 0) return
 
   const now = performance.now()
-  if (!force && !shouldRebaseSpeedWindow && lastProgressUiUpdateAt && now - lastProgressUiUpdateAt < UI_PROGRESS_UPDATE_MS) {
+  const settling = isSpeedSettling(now)
+  if (!force && !shouldRebaseSpeedWindow && !settling && lastProgressUiUpdateAt && now - lastProgressUiUpdateAt < UI_PROGRESS_UPDATE_MS) {
     return
   }
 
@@ -486,6 +511,12 @@ const updateUploadProgress = (bytesUploaded, bytesTotal, force = false) => {
   displayBytesUploaded = Math.max(displayBytesUploaded, bytesUploaded)
   const percentage = (displayBytesUploaded / bytesTotal * 100).toFixed(2)
   progress.value = Math.min(100, Number(percentage))
+
+  if (paused.value && !uploading.value && !force) {
+    rebaseSpeedWindow(bytesUploaded, now)
+    return
+  }
+
   updateRealtimeSpeed(bytesUploaded, now, force)
 }
 
@@ -632,10 +663,11 @@ const startUpload = () => {
   })
 
   upload.findPreviousUploads().then((previousUploads) => {
-    if (previousUploads.length) {
+    const hasPreviousUpload = previousUploads.length > 0
+    if (hasPreviousUpload) {
       upload.resumeFromPreviousUpload(previousUploads[0])
     }
-    beginActiveUploadTiming()
+    beginActiveUploadTiming(hasPreviousUpload)
     upload.start()
   })
 }
@@ -646,13 +678,14 @@ const pauseUpload = () => {
     stopActiveUploadTiming()
     uploading.value = false
     paused.value = true
+    speedSettlingUntilMs = 0
     resetSpeedWindow(performance.now(), true)
   }
 }
 
 const resumeUpload = () => {
   if (upload) {
-    beginActiveUploadTiming()
+    beginActiveUploadTiming(true)
     upload.start()
     uploading.value = true
     paused.value = false
