@@ -149,6 +149,7 @@ const speedHistory = ref([])
 
 const UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
 const SPEED_WINDOW_MS = 10 * 1000
+const MIN_SPEED_SAMPLE_DURATION_MS = 1000
 const UI_PROGRESS_UPDATE_MS = 500
 const SPEED_HISTORY_SAMPLE_MS = 1000
 const SPEED_HISTORY_MAX_POINTS = 120
@@ -164,6 +165,7 @@ let activeUploadStartedAtMs = null
 let activeUploadDurationMs = 0
 let lastSpeedHistorySampleAt = 0
 let lastProgressUiUpdateAt = 0
+let shouldRebaseSpeedWindow = false
 
 const bandwidthUsageWidth = computed(() => {
   const safeUtilization = Number.isFinite(bandwidthUsagePercent.value)
@@ -350,6 +352,7 @@ const resetTransferMetrics = () => {
   activeUploadDurationMs = 0
   lastSpeedHistorySampleAt = 0
   lastProgressUiUpdateAt = 0
+  shouldRebaseSpeedWindow = false
 }
 
 const appendSpeedHistory = (sample, force = false) => {
@@ -372,9 +375,10 @@ const appendSpeedHistory = (sample, force = false) => {
     : nextHistory
 }
 
-const resetSpeedWindow = (now = performance.now()) => {
+const resetSpeedWindow = (now = performance.now(), waitForProgressBaseline = false) => {
   currentSpeedText.value = '0.00'
   speedSamples = [{ time: now, bytes: realtimeBytesUploaded }]
+  shouldRebaseSpeedWindow = waitForProgressBaseline
   appendSpeedHistory({ time: now, mbps: 0 }, true)
 }
 
@@ -389,7 +393,7 @@ const beginActiveUploadTiming = () => {
     activeUploadStartedAtMs = now
   }
 
-  resetSpeedWindow(now)
+  resetSpeedWindow(now, true)
 }
 
 const stopActiveUploadTiming = () => {
@@ -433,7 +437,8 @@ const updateAverageMetrics = () => {
 const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistory = false) => {
   if (!Number.isFinite(bytesUploaded) || bytesUploaded < 0) return
 
-  if (bytesUploaded < realtimeBytesUploaded) {
+  if (shouldRebaseSpeedWindow || bytesUploaded < realtimeBytesUploaded) {
+    shouldRebaseSpeedWindow = false
     realtimeBytesUploaded = bytesUploaded
     resetSpeedWindow(now)
     updateAverageMetrics()
@@ -451,10 +456,16 @@ const updateRealtimeSpeed = (bytesUploaded, now = performance.now(), forceHistor
 
   const first = speedSamples[0]
   const last = speedSamples[speedSamples.length - 1]
-  const elapsedSeconds = (last.time - first.time) / 1000
+  const elapsedMs = last.time - first.time
   const realtimeBytes = last.bytes - first.bytes
 
-  const speedMbps = calculateMbps(realtimeBytes, elapsedSeconds * 1000)
+  if (elapsedMs < MIN_SPEED_SAMPLE_DURATION_MS) {
+    setDisplaySpeed(0)
+    updateAverageMetrics()
+    return
+  }
+
+  const speedMbps = calculateMbps(realtimeBytes, elapsedMs)
 
   const displaySpeedMbps = Number.isFinite(speedMbps) && speedMbps > 0 ? speedMbps : 0
   setDisplaySpeed(displaySpeedMbps)
@@ -467,7 +478,7 @@ const updateUploadProgress = (bytesUploaded, bytesTotal, force = false) => {
   if (!Number.isFinite(bytesUploaded) || !Number.isFinite(bytesTotal) || bytesTotal <= 0) return
 
   const now = performance.now()
-  if (!force && lastProgressUiUpdateAt && now - lastProgressUiUpdateAt < UI_PROGRESS_UPDATE_MS) {
+  if (!force && !shouldRebaseSpeedWindow && lastProgressUiUpdateAt && now - lastProgressUiUpdateAt < UI_PROGRESS_UPDATE_MS) {
     return
   }
 
@@ -635,7 +646,7 @@ const pauseUpload = () => {
     stopActiveUploadTiming()
     uploading.value = false
     paused.value = true
-    resetSpeedWindow()
+    resetSpeedWindow(performance.now(), true)
   }
 }
 
