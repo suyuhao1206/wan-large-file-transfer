@@ -46,7 +46,12 @@
             <span>实时速度</span>
             <span>最近2分钟</span>
           </div>
-          <div class="speed-bars" role="img" aria-label="最近2分钟上传速度柱状图">
+          <div
+            class="speed-bars"
+            role="img"
+            aria-label="最近2分钟上传速度柱状图"
+            :style="{ '--speed-bar-count': SPEED_HISTORY_BAR_COUNT }"
+          >
             <span
               v-for="bar in speedChartBars"
               :key="bar.key"
@@ -153,7 +158,9 @@ const MIN_SPEED_SAMPLE_DURATION_MS = 1000
 const RESUME_SPEED_SETTLE_MS = 3000
 const UI_PROGRESS_UPDATE_MS = 500
 const SPEED_HISTORY_SAMPLE_MS = 1000
-const SPEED_HISTORY_MAX_POINTS = 120
+const SPEED_HISTORY_WINDOW_MS = 2 * 60 * 1000
+const SPEED_HISTORY_BAR_COUNT = Math.ceil(SPEED_HISTORY_WINDOW_MS / SPEED_HISTORY_SAMPLE_MS)
+const SPEED_HISTORY_MAX_POINTS = SPEED_HISTORY_BAR_COUNT + 1
 const FIXED_BANDWIDTH_MBPS = 100
 const PARALLEL_UPLOADS = 4
 
@@ -179,17 +186,23 @@ const bandwidthUsageWidth = computed(() => {
 const speedChartBars = computed(() => {
   if (!speedHistory.value.length) return []
 
+  const visibleHistory = speedHistory.value.slice(-SPEED_HISTORY_BAR_COUNT)
+  const emptySlotCount = Math.max(0, SPEED_HISTORY_BAR_COUNT - visibleHistory.length)
   const maxSpeed = Math.max(
     FIXED_BANDWIDTH_MBPS,
-    ...speedHistory.value.map(sample => sample.mbps)
+    ...visibleHistory.map(sample => sample.mbps)
   )
 
-  return speedHistory.value
+  return [
+    ...Array(emptySlotCount).fill(null),
+    ...visibleHistory
+  ]
     .map((sample, index) => {
-      const ratio = maxSpeed > 0 ? Math.min(sample.mbps / maxSpeed, 1) : 0
+      const mbps = sample?.mbps || 0
+      const ratio = maxSpeed > 0 ? Math.min(mbps / maxSpeed, 1) : 0
       return {
-        key: `${Math.round(sample.time)}-${index}`,
-        height: `${Math.max(4, ratio * 100).toFixed(1)}%`
+        key: index,
+        height: ratio > 0 ? `${Math.max(4, ratio * 100).toFixed(1)}%` : '0%'
       }
     })
 })
@@ -368,10 +381,11 @@ const appendSpeedHistory = (sample, force = false) => {
   }
 
   lastSpeedHistorySampleAt = sample.time
+  const windowStart = sample.time - SPEED_HISTORY_WINDOW_MS
   const nextHistory = [
     ...speedHistory.value,
     sample
-  ]
+  ].filter(item => item.time >= windowStart)
 
   speedHistory.value = nextHistory.length > SPEED_HISTORY_MAX_POINTS
     ? nextHistory.slice(nextHistory.length - SPEED_HISTORY_MAX_POINTS)
@@ -840,18 +854,19 @@ const stopUpload = async () => {
 }
 
 .speed-bars {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(var(--speed-bar-count), minmax(0, 1fr));
   align-items: flex-end;
-  gap: 3px;
+  gap: 2px;
   height: 120px;
   padding: 0 2px;
   border-bottom: 1px solid #e4e7ed;
+  overflow: hidden;
 }
 
 .speed-bars span {
-  flex: 1 1 0;
-  min-width: 2px;
-  max-width: 8px;
+  width: 100%;
+  min-width: 0;
   border-radius: 2px 2px 0 0;
   background: #409eff;
   transition: height 0.2s ease;
