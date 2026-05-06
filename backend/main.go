@@ -35,8 +35,9 @@ import (
 )
 
 const (
-	maxS3MultipartParts    = 10000
-	maxS3MultipartPartSize = int64(5 * 1024 * 1024 * 1024)
+	maxS3MultipartParts      = 10000
+	maxS3MultipartPartSize   = int64(5 * 1024 * 1024 * 1024)
+	maxS3PartCopyConcurrency = 16
 )
 
 // Global Storage
@@ -1407,6 +1408,47 @@ func isBusinessMultipartUpload(ctx context.Context, uploadID string) bool {
 	return isBusinessMultipartChunk(info.MetaData)
 }
 
+func cleanupBusinessMultipartChunks(uploadIDs []string) {
+	if len(uploadIDs) == 0 || dataStore == nil {
+		return
+	}
+
+	ids := append([]string(nil), uploadIDs...)
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		terminater, ok := dataStore.(handler.TerminaterDataStore)
+		if !ok {
+			log.Printf("Business multipart chunk cleanup skipped: data store does not support termination")
+			return
+		}
+
+		for _, uploadID := range ids {
+			uploadID = normalizeUploadID(uploadID)
+			if uploadID == "" {
+				continue
+			}
+
+			upload, err := dataStore.GetUpload(bgCtx, uploadID)
+			if err != nil {
+				log.Printf("Failed to load business chunk for cleanup [%s]: %v", uploadID, err)
+				continue
+			}
+
+			terminatableUpload := terminater.AsTerminatableUpload(upload)
+			if terminatableUpload == nil {
+				log.Printf("Business chunk is not terminatable [%s]", uploadID)
+				continue
+			}
+
+			if err := terminatableUpload.Terminate(bgCtx); err != nil {
+				log.Printf("Failed to cleanup business chunk [%s]: %v", uploadID, err)
+			}
+		}
+	}()
+}
+
 func escapedS3CopySource(bucket string, key string) string {
 	segments := strings.Split(key, "/")
 	for i, segment := range segments {
@@ -1521,7 +1563,7 @@ func finalizeMultipartUpload(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	ownerHash := ""
@@ -1613,31 +1655,52 @@ func finalizeMultipartUpload(c *gin.Context) {
 	}
 
 	completedParts := make([]types.CompletedPart, len(sourceKeys))
-	for i, key := range sourceKeys {
-		partNumber := int32(i + 1)
-		copyOut, err := s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
-			Bucket:     aws.String(s3Bucket),
-			Key:        aws.String(finalUploadID),
-			UploadId:   aws.String(s3MultipartUploadID),
-			PartNumber: aws.Int32(partNumber),
-			CopySource: aws.String(escapedS3CopySource(s3Bucket, key)),
-		})
-		if err != nil {
-			abortMultipart()
-			log.Printf("Failed to copy chunk %d (%s) into %s: %v", i, key, finalUploadID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to copy chunk %d", i)})
-			return
-		}
-		if copyOut.CopyPartResult == nil || copyOut.CopyPartResult.ETag == nil || *copyOut.CopyPartResult.ETag == "" {
-			abortMultipart()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("S3 copy result for chunk %d is missing ETag", i)})
-			return
-		}
+	copyErrCh := make(chan error, len(sourceKeys))
+	copyLimiter := make(chan struct{}, maxS3PartCopyConcurrency)
+	var copyWg sync.WaitGroup
+	var copyMu sync.Mutex
 
-		completedParts[i] = types.CompletedPart{
-			ETag:       copyOut.CopyPartResult.ETag,
-			PartNumber: aws.Int32(partNumber),
-		}
+	for i, key := range sourceKeys {
+		copyWg.Add(1)
+		go func(index int, sourceKey string) {
+			defer copyWg.Done()
+
+			copyLimiter <- struct{}{}
+			defer func() { <-copyLimiter }()
+
+			partNumber := int32(index + 1)
+			copyOut, err := s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+				Bucket:     aws.String(s3Bucket),
+				Key:        aws.String(finalUploadID),
+				UploadId:   aws.String(s3MultipartUploadID),
+				PartNumber: aws.Int32(partNumber),
+				CopySource: aws.String(escapedS3CopySource(s3Bucket, sourceKey)),
+			})
+			if err != nil {
+				copyErrCh <- fmt.Errorf("chunk %d copy failed: %w", index, err)
+				return
+			}
+			if copyOut.CopyPartResult == nil || copyOut.CopyPartResult.ETag == nil || *copyOut.CopyPartResult.ETag == "" {
+				copyErrCh <- fmt.Errorf("chunk %d copy result is missing ETag", index)
+				return
+			}
+
+			copyMu.Lock()
+			completedParts[index] = types.CompletedPart{
+				ETag:       copyOut.CopyPartResult.ETag,
+				PartNumber: aws.Int32(partNumber),
+			}
+			copyMu.Unlock()
+		}(i, key)
+	}
+
+	copyWg.Wait()
+	close(copyErrCh)
+	if err := <-copyErrCh; err != nil {
+		abortMultipart()
+		log.Printf("Failed to copy chunks into %s: %v", finalUploadID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
 	_, err = s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
@@ -1660,6 +1723,7 @@ func finalizeMultipartUpload(c *gin.Context) {
 	mu.Unlock()
 	cacheS3ObjectKey(finalUploadID, finalUploadID)
 	aggregateUploadMetrics(finalUploadID, uploadIDs)
+	cleanupBusinessMultipartChunks(uploadIDs)
 	if ownerHash != "" {
 		rememberUploadOwner(finalUploadID, ownerHash)
 	}

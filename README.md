@@ -180,6 +180,7 @@ docker compose --env-file .env.production pull minio
 - 前端不再使用 tus `parallelUploads` / `Upload-Concat`，改为 4 路独立 tus 上传任务。
 - 每个 tus 上传任务的 `chunkSize` 保持 `64 * 1024 * 1024`，用于网络层断点续传。
 - 所有业务分片完成后，后端通过 `/api/finalize-multipart` 调用 S3 multipart `UploadPartCopy` 生成最终对象。
+- 后端并发执行 S3 part copy，并在最终对象完成后异步清理原始 tus 业务分片。
 - 前端实时显示最近 10 秒上传进度估算速度。
 - 前端按 100 Mbps 固定带宽显示当前利用率和平均利用率。
 - 前端显示上传全程实时速度曲线。
@@ -190,6 +191,7 @@ docker compose --env-file .env.production pull minio
   - `proxy_buffering off`
   - `proxy_http_version 1.1`
   - 长上传超时
+- Nginx HTTPS 服务已声明 HTTP/3/QUIC，并在 Docker Compose 中开放 `443/udp`。
 - Nginx 增加：
   - `worker_processes auto`
   - `worker_connections 8192`

@@ -97,15 +97,21 @@ http {
 
     server {
         listen       443 ssl;
+        listen       443 quic reuseport;
+        http2        on;
         server_name  ${NGINX_SERVER_NAME};
 
         ssl_certificate      /etc/nginx/certs/${NGINX_SSL_CERTIFICATE};
         ssl_certificate_key  /etc/nginx/certs/${NGINX_SSL_CERTIFICATE_KEY};
         ssl_session_cache    shared:SSL:1m;
         ssl_session_timeout  5m;
+        ssl_protocols        TLSv1.2 TLSv1.3;
 
         ssl_ciphers  HIGH:!aNULL:!MD5;
         ssl_prefer_server_ciphers  on;
+        quic_retry on;
+        add_header Alt-Svc 'h3=":443"; ma=86400' always;
+        add_header QUIC-Status $http3 always;
 
         location / {
             proxy_pass http://frontend;
