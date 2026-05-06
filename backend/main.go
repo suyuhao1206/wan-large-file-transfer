@@ -38,6 +38,7 @@ const (
 	maxS3MultipartParts      = 10000
 	maxS3MultipartPartSize   = int64(5 * 1024 * 1024 * 1024)
 	maxS3PartCopyConcurrency = 16
+	mergeTaskCleanupDelay     = 5 * time.Minute
 	mergeTaskStatusProcessing = "processing"
 	mergeTaskStatusSuccess    = "success"
 	mergeTaskStatusFailed     = "failed"
@@ -1524,6 +1525,18 @@ func (task *MergeTask) status() string {
 	return task.Status
 }
 
+func (task *MergeTask) scheduleCleanup() {
+	time.AfterFunc(mergeTaskCleanupDelay, func() {
+		value, exists := mergeTasks.Load(task.TaskID)
+		if !exists {
+			return
+		}
+		if currentTask, ok := value.(*MergeTask); ok && currentTask == task {
+			mergeTasks.Delete(task.TaskID)
+		}
+	})
+}
+
 func (task *MergeTask) markSuccess(code string) {
 	task.mu.Lock()
 	task.Status = mergeTaskStatusSuccess
@@ -1531,6 +1544,8 @@ func (task *MergeTask) markSuccess(code string) {
 	task.Error = ""
 	task.UpdatedAt = time.Now().UTC()
 	task.mu.Unlock()
+
+	task.scheduleCleanup()
 }
 
 func (task *MergeTask) markFailed(err error) {
@@ -1544,6 +1559,8 @@ func (task *MergeTask) markFailed(err error) {
 	task.Error = message
 	task.UpdatedAt = time.Now().UTC()
 	task.mu.Unlock()
+
+	task.scheduleCleanup()
 }
 
 func (task *MergeTask) setOwnerHash(ownerHash string) {
