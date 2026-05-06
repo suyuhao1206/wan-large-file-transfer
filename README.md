@@ -171,7 +171,8 @@ docker compose --env-file .env.production pull minio
 
 ```text
 浏览器 -> Nginx -> Go backend/tusd -> MinIO
-浏览器 -> Go backend /api/finalize-multipart -> MinIO/S3 multipart copy
+浏览器 -> Go backend /api/finalize-multipart -> 异步后台任务 -> MinIO/S3 multipart copy
+浏览器 -> Go backend /api/merge-status/:task_id 轮询合并状态
 ```
 
 已落地的上传优化：
@@ -179,7 +180,8 @@ docker compose --env-file .env.production pull minio
 - 前端使用 `Blob.slice()` 按 5GB 生成业务分片，不把大文件读入内存。
 - 前端不再使用 tus `parallelUploads` / `Upload-Concat`，改为 4 路独立 tus 上传任务。
 - 每个 tus 上传任务的 `chunkSize` 保持 `64 * 1024 * 1024`，用于网络层断点续传。
-- 所有业务分片完成后，后端通过 `/api/finalize-multipart` 调用 S3 multipart `UploadPartCopy` 生成最终对象。
+- 所有业务分片完成后，后端通过 `/api/finalize-multipart` 提交异步合并任务，再由后台调用 S3 multipart `UploadPartCopy` 生成最终对象。
+- 前端通过 `/api/merge-status/:task_id` 轮询合并状态，避免长 HTTP 请求被浏览器或网关超时切断。
 - 后端并发执行 S3 part copy，并在最终对象完成后异步清理原始 tus 业务分片。
 - 前端实时显示最近 10 秒上传进度估算速度。
 - 前端按 100 Mbps 固定带宽显示当前利用率和平均利用率。
@@ -268,6 +270,36 @@ POST /api/finalize-multipart
       "size": 5368709120
     }
   ]
+}
+```
+
+返回示例：
+
+```json
+{
+  "message": "merge task submitted",
+  "task_id": "final-7d9f1c2e6a0b4c8d9e0f123456789abc",
+  "status": "processing",
+  "upload_id": "final-7d9f1c2e6a0b4c8d9e0f123456789abc",
+  "filename": "500G_Data.zip"
+}
+```
+
+### 查询合并状态
+
+```http
+GET /api/merge-status/:task_id
+```
+
+成功返回示例：
+
+```json
+{
+  "task_id": "final-7d9f1c2e6a0b4c8d9e0f123456789abc",
+  "status": "success",
+  "upload_id": "final-7d9f1c2e6a0b4c8d9e0f123456789abc",
+  "filename": "500G_Data.zip",
+  "code": "Ab3K9xQe"
 }
 ```
 

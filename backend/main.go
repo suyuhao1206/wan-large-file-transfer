@@ -38,6 +38,9 @@ const (
 	maxS3MultipartParts      = 10000
 	maxS3MultipartPartSize   = int64(5 * 1024 * 1024 * 1024)
 	maxS3PartCopyConcurrency = 16
+	mergeTaskStatusProcessing = "processing"
+	mergeTaskStatusSuccess    = "success"
+	mergeTaskStatusFailed     = "failed"
 )
 
 // Global Storage
@@ -45,6 +48,7 @@ var (
     codeToUpload = make(map[string]UploadRecord)
     s3KeyCache   = make(map[string]string)
 	uploadMetrics = make(map[string]UploadMetric)
+	mergeTasks    sync.Map
     mu           sync.RWMutex
 	metricsMu    sync.RWMutex
     
@@ -83,6 +87,19 @@ type FinalizeMultipartRequest struct {
 	Filetype  string                   `json:"filetype"`
 	TotalSize int64                    `json:"total_size" binding:"required"`
 	Chunks    []FinalizeMultipartChunk `json:"chunks" binding:"required"`
+}
+
+type MergeTask struct {
+	mu        sync.RWMutex
+	TaskID    string
+	Status    string
+	UploadID  string
+	Code      string
+	Filename  string
+	OwnerHash string
+	Error     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type UploadMetric struct {
@@ -694,6 +711,7 @@ func main() {
     api.Use(apiKeyAuth()) // Apply API key authentication to all API routes
     {
         api.POST("/finalize-multipart", finalizeMultipartUpload)
+        api.GET("/merge-status/:task_id", getMergeStatus)
         api.POST("/get-code", getShareCode)
         api.GET("/files", listUserFiles)
         api.GET("/retrieve/:code", retrieveFile)
@@ -1487,34 +1505,137 @@ func createShareCodeForUpload(ctx context.Context, uploadID string, filename str
 	return uploadID
 }
 
-func finalizeMultipartUpload(c *gin.Context) {
-	if s3Client == nil {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "S3 storage is required for multipart finalize"})
+func newMergeTask(taskID string, filename string, ownerHash string) *MergeTask {
+	now := time.Now().UTC()
+	return &MergeTask{
+		TaskID:    taskID,
+		Status:    mergeTaskStatusProcessing,
+		UploadID:  taskID,
+		Filename:  filename,
+		OwnerHash: ownerHash,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func (task *MergeTask) status() string {
+	task.mu.RLock()
+	defer task.mu.RUnlock()
+	return task.Status
+}
+
+func (task *MergeTask) markSuccess(code string) {
+	task.mu.Lock()
+	task.Status = mergeTaskStatusSuccess
+	task.Code = code
+	task.Error = ""
+	task.UpdatedAt = time.Now().UTC()
+	task.mu.Unlock()
+}
+
+func (task *MergeTask) markFailed(err error) {
+	message := "merge task failed"
+	if err != nil {
+		message = err.Error()
+	}
+
+	task.mu.Lock()
+	task.Status = mergeTaskStatusFailed
+	task.Error = message
+	task.UpdatedAt = time.Now().UTC()
+	task.mu.Unlock()
+}
+
+func (task *MergeTask) setOwnerHash(ownerHash string) {
+	if ownerHash == "" {
 		return
 	}
 
-	var req FinalizeMultipartRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid finalize request"})
-		return
+	task.mu.Lock()
+	if task.OwnerHash == "" {
+		task.OwnerHash = ownerHash
+	}
+	task.UpdatedAt = time.Now().UTC()
+	task.mu.Unlock()
+}
+
+func mergeTaskResponse(task *MergeTask) gin.H {
+	task.mu.RLock()
+	taskID := task.TaskID
+	status := task.Status
+	uploadID := task.UploadID
+	code := task.Code
+	filename := task.Filename
+	errMessage := task.Error
+	createdAt := task.CreatedAt
+	updatedAt := task.UpdatedAt
+	task.mu.RUnlock()
+
+	response := gin.H{
+		"task_id":    taskID,
+		"status":     status,
+		"upload_id":  uploadID,
+		"filename":   filename,
+		"created_at": createdAt.Format(time.RFC3339),
+		"updated_at": updatedAt.Format(time.RFC3339),
+	}
+	if errMessage != "" {
+		response["error"] = errMessage
+	}
+	if status == mergeTaskStatusSuccess && code != "" {
+		for key, value := range shareCodeResponse(uploadID, code, filename) {
+			response[key] = value
+		}
 	}
 
+	return response
+}
+
+func currentRequestOwner(c *gin.Context) (string, bool) {
+	ownerHash := ""
+	if value, exists := c.Get("api_key_hash"); exists {
+		if hash, ok := value.(string); ok {
+			ownerHash = hash
+		}
+	}
+
+	isAdmin := false
+	if value, exists := c.Get("is_admin"); exists {
+		if admin, ok := value.(bool); ok {
+			isAdmin = admin
+		}
+	}
+
+	return ownerHash, isAdmin
+}
+
+func canAccessMergeTask(c *gin.Context, task *MergeTask) bool {
+	ownerHash, isAdmin := currentRequestOwner(c)
+	if isAdmin || task == nil {
+		return true
+	}
+
+	task.mu.RLock()
+	taskOwnerHash := task.OwnerHash
+	task.mu.RUnlock()
+
+	return taskOwnerHash == "" || ownerHash == "" || taskOwnerHash == ownerHash
+}
+
+func prepareFinalizeMultipartRequest(req *FinalizeMultipartRequest) ([]FinalizeMultipartChunk, []string, error) {
 	req.Filename = strings.TrimSpace(req.Filename)
+	req.Filetype = strings.TrimSpace(req.Filetype)
 	if req.Filename == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "filename is required"})
-		return
+		return nil, nil, fmt.Errorf("filename is required")
 	}
 	if req.TotalSize <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "total_size must be greater than zero"})
-		return
+		return nil, nil, fmt.Errorf("total_size must be greater than zero")
 	}
 	if len(req.Chunks) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "chunks are required"})
-		return
+		return nil, nil, fmt.Errorf("chunks are required")
 	}
 	if len(req.Chunks) > maxS3MultipartParts {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "too many chunks for S3 multipart upload"})
-		return
+		return nil, nil, fmt.Errorf("too many chunks for S3 multipart upload")
 	}
 
 	chunks := append([]FinalizeMultipartChunk(nil), req.Chunks...)
@@ -1531,12 +1652,10 @@ func finalizeMultipartUpload(c *gin.Context) {
 	for i := range chunks {
 		chunks[i].UploadID = normalizeUploadID(strings.TrimSpace(chunks[i].UploadID))
 		if chunks[i].UploadID == "" || !codeRegex.MatchString(chunks[i].UploadID) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid chunk upload_id at index %d", i)})
-			return
+			return nil, nil, fmt.Errorf("invalid chunk upload_id at index %d", i)
 		}
 		if seenUploadIDs[chunks[i].UploadID] {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("duplicated chunk upload_id at index %d", i)})
-			return
+			return nil, nil, fmt.Errorf("duplicated chunk upload_id at index %d", i)
 		}
 		seenUploadIDs[chunks[i].UploadID] = true
 
@@ -1547,66 +1666,173 @@ func finalizeMultipartUpload(c *gin.Context) {
 			chunks[i].Size = chunks[i].End - chunks[i].Start
 		}
 		if chunks[i].Start != expectedStart || chunks[i].End <= chunks[i].Start || chunks[i].Size != chunks[i].End-chunks[i].Start {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid chunk byte range at index %d", i)})
-			return
+			return nil, nil, fmt.Errorf("invalid chunk byte range at index %d", i)
 		}
 		if chunks[i].Size > maxS3MultipartPartSize {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("chunk %d exceeds the 5GB S3 multipart part limit", i)})
-			return
+			return nil, nil, fmt.Errorf("chunk %d exceeds the 5GB S3 multipart part limit", i)
 		}
 
 		expectedStart = chunks[i].End
 		uploadIDs = append(uploadIDs, chunks[i].UploadID)
 	}
 	if expectedStart != req.TotalSize {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "chunks do not cover total_size"})
+		return nil, nil, fmt.Errorf("chunks do not cover total_size")
+	}
+
+	return chunks, uploadIDs, nil
+}
+
+func mergeTaskID(req FinalizeMultipartRequest, chunks []FinalizeMultipartChunk) string {
+	hash := sha256.New()
+	hash.Write([]byte(req.Filename))
+	hash.Write([]byte{0})
+	hash.Write([]byte(req.Filetype))
+	hash.Write([]byte{0})
+	hash.Write([]byte(strconv.FormatInt(req.TotalSize, 10)))
+	for _, chunk := range chunks {
+		hash.Write([]byte{0})
+		hash.Write([]byte(chunk.UploadID))
+		hash.Write([]byte{0})
+		hash.Write([]byte(strconv.FormatInt(chunk.Start, 10)))
+		hash.Write([]byte{0})
+		hash.Write([]byte(strconv.FormatInt(chunk.End, 10)))
+	}
+
+	return "final-" + hex.EncodeToString(hash.Sum(nil))[:32]
+}
+
+func completedMergeTaskResponse(c *gin.Context, taskID string) (gin.H, int, bool) {
+	if db == nil {
+		return nil, http.StatusNotFound, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var code string
+	var filename string
+	var ownerHash sql.NullString
+	err := db.QueryRowContext(ctx, `
+		SELECT code, filename, owner_key_hash
+		FROM share_codes
+		WHERE upload_id=$1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, taskID).Scan(&code, &filename, &ownerHash)
+	if err != nil {
+		return nil, http.StatusNotFound, false
+	}
+
+	requestOwnerHash, isAdmin := currentRequestOwner(c)
+	if !isAdmin && ownerHash.Valid && requestOwnerHash != "" && ownerHash.String != requestOwnerHash {
+		return gin.H{"error": "merge task ownership mismatch"}, http.StatusForbidden, true
+	}
+
+	response := shareCodeResponse(taskID, code, filename)
+	response["task_id"] = taskID
+	response["status"] = mergeTaskStatusSuccess
+	response["upload_id"] = taskID
+	return response, http.StatusOK, true
+}
+
+func finalizeMultipartUpload(c *gin.Context) {
+	if s3Client == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "S3 storage is required for multipart finalize"})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
+	var req FinalizeMultipartRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid finalize request"})
+		return
+	}
 
-	ownerHash := ""
-	if value, exists := c.Get("api_key_hash"); exists {
-		if hash, ok := value.(string); ok {
-			ownerHash = hash
+	chunks, uploadIDs, validationErr := prepareFinalizeMultipartRequest(&req)
+	if validationErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error()})
+		return
+	}
+
+	ownerHash, isAdmin := currentRequestOwner(c)
+	taskID := mergeTaskID(req, chunks)
+	if response, status, exists := completedMergeTaskResponse(c, taskID); exists {
+		if status == http.StatusOK {
+			response["message"] = "merge task already completed"
+		}
+		c.JSON(status, response)
+		return
+	}
+
+	task := newMergeTask(taskID, req.Filename, ownerHash)
+	actual, loaded := mergeTasks.LoadOrStore(taskID, task)
+	if loaded {
+		existingTask := actual.(*MergeTask)
+		if !canAccessMergeTask(c, existingTask) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "merge task ownership mismatch"})
+			return
+		}
+		if existingTask.status() == mergeTaskStatusFailed {
+			mergeTasks.Delete(taskID)
+			actual, loaded = mergeTasks.LoadOrStore(taskID, task)
+			if loaded {
+				existingTask = actual.(*MergeTask)
+				response := mergeTaskResponse(existingTask)
+				response["message"] = "merge task already exists"
+				c.JSON(http.StatusOK, response)
+				return
+			}
+		} else {
+			response := mergeTaskResponse(existingTask)
+			response["message"] = "merge task already exists"
+			c.JSON(http.StatusOK, response)
+			return
 		}
 	}
-	isAdmin, _ := c.Get("is_admin")
+
+	go runFinalizeMultipartTask(task, req, chunks, uploadIDs, ownerHash, isAdmin)
+
+	response := mergeTaskResponse(task)
+	response["message"] = "merge task submitted"
+	c.JSON(http.StatusOK, response)
+}
+
+func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chunks []FinalizeMultipartChunk, uploadIDs []string, ownerHash string, isAdmin bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
 
 	sourceKeys := make([]string, len(chunks))
 	for i, chunk := range chunks {
 		upload, err := dataStore.GetUpload(ctx, chunk.UploadID)
 		if err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d is not available", i)})
+			task.markFailed(fmt.Errorf("chunk %d is not available: %w", i, err))
 			return
 		}
 
 		info, err := upload.GetInfo(ctx)
 		if err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d metadata is not available", i)})
+			task.markFailed(fmt.Errorf("chunk %d metadata is not available: %w", i, err))
 			return
 		}
 		if info.IsPartial || info.IsFinal || info.Offset < info.Size {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d is not completed", i)})
+			task.markFailed(fmt.Errorf("chunk %d is not completed", i))
 			return
 		}
 		if info.Size != chunk.Size {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d size mismatch", i)})
+			task.markFailed(fmt.Errorf("chunk %d size mismatch", i))
 			return
 		}
 
 		if db != nil && ownerHash != "" && isAdmin != true {
 			chunkOwnerHash := ownerHashForUpload(ctx, chunk.UploadID)
 			if chunkOwnerHash != "" && chunkOwnerHash != ownerHash {
-				c.JSON(http.StatusForbidden, gin.H{"error": "chunk ownership mismatch"})
+				task.markFailed(fmt.Errorf("chunk ownership mismatch"))
 				return
 			}
 		}
 
 		key, err := resolveS3ObjectKey(ctx, chunk.UploadID)
 		if err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d object is not available", i)})
+			task.markFailed(fmt.Errorf("chunk %d object is not available: %w", i, err))
 			return
 		}
 		sourceKeys[i] = key
@@ -1614,9 +1840,9 @@ func finalizeMultipartUpload(c *gin.Context) {
 
 	if ownerHash == "" && len(uploadIDs) > 0 {
 		ownerHash = ownerHashForUpload(ctx, uploadIDs[0])
+		task.setOwnerHash(ownerHash)
 	}
 
-	finalUploadID := "final-" + genCode(24)
 	contentType := strings.TrimSpace(req.Filetype)
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -1624,19 +1850,19 @@ func finalizeMultipartUpload(c *gin.Context) {
 
 	createOut, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:      aws.String(s3Bucket),
-		Key:         aws.String(finalUploadID),
+		Key:         aws.String(task.UploadID),
 		ContentType: aws.String(contentType),
 		Metadata: map[string]string{
 			"filecodebox-finalized": "true",
 		},
 	})
 	if err != nil {
-		log.Printf("Failed to create multipart upload for %s: %v", finalUploadID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start S3 multipart compose"})
+		log.Printf("Failed to create multipart upload for %s: %v", task.UploadID, err)
+		task.markFailed(fmt.Errorf("failed to start S3 multipart compose: %w", err))
 		return
 	}
 	if createOut.UploadId == nil || *createOut.UploadId == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "S3 multipart upload id is empty"})
+		task.markFailed(fmt.Errorf("S3 multipart upload id is empty"))
 		return
 	}
 	s3MultipartUploadID := *createOut.UploadId
@@ -1646,11 +1872,11 @@ func finalizeMultipartUpload(c *gin.Context) {
 		defer abortCancel()
 		_, abortErr := s3Client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
 			Bucket:   aws.String(s3Bucket),
-			Key:      aws.String(finalUploadID),
+			Key:      aws.String(task.UploadID),
 			UploadId: aws.String(s3MultipartUploadID),
 		})
 		if abortErr != nil {
-			log.Printf("Failed to abort multipart upload %s: %v", finalUploadID, abortErr)
+			log.Printf("Failed to abort multipart upload %s: %v", task.UploadID, abortErr)
 		}
 	}
 
@@ -1671,7 +1897,7 @@ func finalizeMultipartUpload(c *gin.Context) {
 			partNumber := int32(index + 1)
 			copyOut, err := s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
 				Bucket:     aws.String(s3Bucket),
-				Key:        aws.String(finalUploadID),
+				Key:        aws.String(task.UploadID),
 				UploadId:   aws.String(s3MultipartUploadID),
 				PartNumber: aws.Int32(partNumber),
 				CopySource: aws.String(escapedS3CopySource(s3Bucket, sourceKey)),
@@ -1698,14 +1924,14 @@ func finalizeMultipartUpload(c *gin.Context) {
 	close(copyErrCh)
 	if err := <-copyErrCh; err != nil {
 		abortMultipart()
-		log.Printf("Failed to copy chunks into %s: %v", finalUploadID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("Failed to copy chunks into %s: %v", task.UploadID, err)
+		task.markFailed(err)
 		return
 	}
 
 	_, err = s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(s3Bucket),
-		Key:      aws.String(finalUploadID),
+		Key:      aws.String(task.UploadID),
 		UploadId: aws.String(s3MultipartUploadID),
 		MultipartUpload: &types.CompletedMultipartUpload{
 			Parts: completedParts,
@@ -1713,25 +1939,47 @@ func finalizeMultipartUpload(c *gin.Context) {
 	})
 	if err != nil {
 		abortMultipart()
-		log.Printf("Failed to complete multipart upload for %s: %v", finalUploadID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete S3 multipart compose"})
+		log.Printf("Failed to complete multipart upload for %s: %v", task.UploadID, err)
+		task.markFailed(fmt.Errorf("failed to complete S3 multipart compose: %w", err))
 		return
 	}
 
 	mu.Lock()
-	codeToUpload[finalUploadID] = UploadRecord{UploadID: finalUploadID, Filename: req.Filename}
+	codeToUpload[task.UploadID] = UploadRecord{UploadID: task.UploadID, Filename: req.Filename}
 	mu.Unlock()
-	cacheS3ObjectKey(finalUploadID, finalUploadID)
-	aggregateUploadMetrics(finalUploadID, uploadIDs)
+	cacheS3ObjectKey(task.UploadID, task.UploadID)
+	aggregateUploadMetrics(task.UploadID, uploadIDs)
 	cleanupBusinessMultipartChunks(uploadIDs)
 	if ownerHash != "" {
-		rememberUploadOwner(finalUploadID, ownerHash)
+		rememberUploadOwner(task.UploadID, ownerHash)
 	}
-	code := createShareCodeForUpload(ctx, finalUploadID, req.Filename, ownerHash)
+	code := createShareCodeForUpload(ctx, task.UploadID, req.Filename, ownerHash)
+	task.markSuccess(code)
+}
 
-	response := shareCodeResponse(finalUploadID, code, req.Filename)
-	response["upload_id"] = finalUploadID
-	c.JSON(http.StatusOK, response)
+func getMergeStatus(c *gin.Context) {
+	taskID := strings.TrimSpace(c.Param("task_id"))
+	if taskID == "" || !codeRegex.MatchString(taskID) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "merge task not found"})
+		return
+	}
+
+	if value, exists := mergeTasks.Load(taskID); exists {
+		task := value.(*MergeTask)
+		if !canAccessMergeTask(c, task) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "merge task ownership mismatch"})
+			return
+		}
+		c.JSON(http.StatusOK, mergeTaskResponse(task))
+		return
+	}
+
+	if response, status, exists := completedMergeTaskResponse(c, taskID); exists {
+		c.JSON(status, response)
+		return
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "merge task not found"})
 }
 
 func getShareCode(c *gin.Context) {

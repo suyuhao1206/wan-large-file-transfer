@@ -165,6 +165,8 @@ const finishedChunks = ref(0)
 const BUSINESS_CHUNK_SIZE = 5 * 1024 * 1024 * 1024
 const TUS_NETWORK_CHUNK_SIZE = 64 * 1024 * 1024
 const BUSINESS_UPLOAD_CONCURRENCY = 4
+const MERGE_POLL_INTERVAL_MS = 3000
+const MERGE_POLL_MAX_ERRORS = 20
 const SPEED_WINDOW_MS = 10 * 1000
 const MIN_SPEED_SAMPLE_DURATION_MS = 1000
 const RESUME_SPEED_SETTLE_MS = 3000
@@ -792,7 +794,50 @@ const runConcurrent = async (items, limit, worker) => {
   await Promise.all(runners)
 }
 
-const finalizeUpload = async () => {
+const sleep = (durationMs) => new Promise(resolve => setTimeout(resolve, durationMs))
+
+const pollMergeStatus = async (taskId, token) => {
+  let consecutiveErrors = 0
+
+  while (true) {
+    if (token !== runToken) {
+      throw new Error('合并轮询已取消')
+    }
+
+    await sleep(MERGE_POLL_INTERVAL_MS)
+
+    try {
+      const res = await axios.get(`/api/merge-status/${encodeURIComponent(taskId)}`, {
+        headers: buildHeaders()
+      })
+      consecutiveErrors = 0
+
+      const status = res.data.status
+      if (status === 'success') {
+        return res.data
+      }
+      if (status === 'failed') {
+        const mergeError = new Error(res.data.error || '后端合并失败')
+        mergeError.isMergeFailed = true
+        throw mergeError
+      }
+
+      uploadStatusText.value = '正在合并文件，请保持页面打开'
+    } catch (err) {
+      if (err.isMergeFailed) {
+        throw err
+      }
+
+      consecutiveErrors += 1
+      uploadStatusText.value = `正在等待合并状态 ${consecutiveErrors}/${MERGE_POLL_MAX_ERRORS}`
+      if (consecutiveErrors >= MERGE_POLL_MAX_ERRORS) {
+        throw err
+      }
+    }
+  }
+}
+
+const finalizeUpload = async (token) => {
   const chunks = completedChunks.map((chunk, index) => {
     if (!chunk) {
       throw new Error(`分片 ${index + 1} 尚未完成`)
@@ -800,7 +845,7 @@ const finalizeUpload = async () => {
     return chunk
   })
 
-  uploadStatusText.value = '正在合并文件'
+  uploadStatusText.value = '正在合并文件，请保持页面打开'
   finalizing.value = true
   stopActiveUploadTiming()
 
@@ -813,7 +858,20 @@ const finalizeUpload = async () => {
     headers: buildHeaders()
   })
 
-  shareCode.value = res.data.code
+  const taskId = res.data.task_id
+  if (!taskId) {
+    throw new Error('后端未返回合并任务 ID')
+  }
+
+  const finalRes = res.data.status === 'success'
+    ? res.data
+    : await pollMergeStatus(taskId, token)
+
+  if (!finalRes.code) {
+    throw new Error('合并成功但后端未返回取件码')
+  }
+
+  shareCode.value = finalRes.code
   uploaded.value = true
   finalizing.value = false
   uploading.value = false
@@ -821,7 +879,7 @@ const finalizeUpload = async () => {
   uploadStatusText.value = '已完成'
   updateUploadProgress(file.value.size, file.value.size, true)
   finishStats()
-  applyServerUploadMetric(res.data.upload_metric)
+  applyServerUploadMetric(finalRes.upload_metric)
 }
 
 const runUploadWorkflow = async (resume = false) => {
@@ -845,7 +903,7 @@ const runUploadWorkflow = async (resume = false) => {
     if (!isRunActive(token)) return
 
     updateUploadProgress(file.value.size, file.value.size, true)
-    await finalizeUpload()
+    await finalizeUpload(token)
   } catch (err) {
     if (token !== runToken || paused.value) return
 
