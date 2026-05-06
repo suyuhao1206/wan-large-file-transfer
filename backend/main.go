@@ -25,12 +25,18 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
     "github.com/gin-contrib/cors"
     "github.com/gin-gonic/gin"
     "github.com/tus/tusd/v2/pkg/filestore"
     "github.com/tus/tusd/v2/pkg/handler"
     "github.com/tus/tusd/v2/pkg/s3store"
     _ "github.com/lib/pq"
+)
+
+const (
+	maxS3MultipartParts    = 10000
+	maxS3MultipartPartSize = int64(5 * 1024 * 1024 * 1024)
 )
 
 // Global Storage
@@ -61,6 +67,21 @@ var (
 type UploadRecord struct {
 	UploadID string `json:"upload_id"`
 	Filename string `json:"filename"`
+}
+
+type FinalizeMultipartChunk struct {
+	UploadID string `json:"upload_id" binding:"required"`
+	Index    int    `json:"index"`
+	Start    int64  `json:"start"`
+	End      int64  `json:"end"`
+	Size     int64  `json:"size"`
+}
+
+type FinalizeMultipartRequest struct {
+	Filename  string                   `json:"filename" binding:"required"`
+	Filetype  string                   `json:"filetype"`
+	TotalSize int64                    `json:"total_size" binding:"required"`
+	Chunks    []FinalizeMultipartChunk `json:"chunks" binding:"required"`
 }
 
 type UploadMetric struct {
@@ -297,6 +318,11 @@ func main() {
             
             filename := extractFilename(event.Upload.MetaData)
 
+			if isBusinessMultipartChunk(event.Upload.MetaData) {
+				log.Printf("Event: Business multipart chunk completed - ID: %s, Filename: %s", uploadID, filename)
+				continue
+			}
+
 			mu.Lock()
 			codeToUpload[uploadID] = UploadRecord{
 				UploadID: uploadID,
@@ -396,6 +422,7 @@ func main() {
         // 1. Handle Download (GET)
         if c.Request.Method == "GET" && uploadID != "" {
             filename := "download"
+			directBusinessChunk := false
 			
 			mu.RLock()
 			record, exists := codeToUpload[uploadID]
@@ -406,10 +433,14 @@ func main() {
 			} else {
 				if upload, err := dataStore.GetUpload(context.Background(), uploadID); err == nil {
 					if info, err := upload.GetInfo(context.Background()); err == nil {
-						filename = extractFilename(info.MetaData)
-						mu.Lock()
-						codeToUpload[uploadID] = UploadRecord{UploadID: uploadID, Filename: filename}
-						mu.Unlock()
+						if isBusinessMultipartChunk(info.MetaData) {
+							directBusinessChunk = true
+						} else {
+							filename = extractFilename(info.MetaData)
+							mu.Lock()
+							codeToUpload[uploadID] = UploadRecord{UploadID: uploadID, Filename: filename}
+							mu.Unlock()
+						}
 					}
 				}
 			}
@@ -472,6 +503,10 @@ func main() {
                         c.JSON(404, gin.H{"error": "Code not found"})
                         return
                     }
+					if isBusinessMultipartChunk(info.MetaData) {
+						c.JSON(404, gin.H{"error": "Code not found"})
+						return
+					}
                     fname = extractFilename(info.MetaData)
                     exp := shareCodeExpiresAt()
                     
@@ -490,6 +525,10 @@ func main() {
                     filename = fname
                 }
             }
+			if db == nil && directBusinessChunk {
+				c.JSON(404, gin.H{"error": "File not found"})
+				return
+			}
 
 			// S3 Download (Redirect to Presigned URL)
 			if s3Client != nil {
@@ -653,6 +692,7 @@ func main() {
     api := r.Group("/api")
     api.Use(apiKeyAuth()) // Apply API key authentication to all API routes
     {
+        api.POST("/finalize-multipart", finalizeMultipartUpload)
         api.POST("/get-code", getShareCode)
         api.GET("/files", listUserFiles)
         api.GET("/retrieve/:code", retrieveFile)
@@ -1324,6 +1364,312 @@ func extractFilename(meta map[string]string) string {
 	return val
 }
 
+func metadataText(meta map[string]string, key string) string {
+	if meta == nil {
+		return ""
+	}
+
+	value := strings.TrimSpace(meta[key])
+	if value == "" {
+		return ""
+	}
+
+	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
+		decodedValue := strings.TrimSpace(string(decoded))
+		if decodedValue != "" {
+			return decodedValue
+		}
+	}
+
+	return value
+}
+
+func isBusinessMultipartChunk(meta map[string]string) bool {
+	return strings.EqualFold(metadataText(meta, "filecodebox_multipart"), "true") ||
+		strings.EqualFold(metadataText(meta, "multipart_upload"), "true")
+}
+
+func isBusinessMultipartUpload(ctx context.Context, uploadID string) bool {
+	if dataStore == nil || uploadID == "" {
+		return false
+	}
+
+	upload, err := dataStore.GetUpload(ctx, uploadID)
+	if err != nil {
+		return false
+	}
+
+	info, err := upload.GetInfo(ctx)
+	if err != nil {
+		return false
+	}
+
+	return isBusinessMultipartChunk(info.MetaData)
+}
+
+func escapedS3CopySource(bucket string, key string) string {
+	segments := strings.Split(key, "/")
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+
+	return url.PathEscape(bucket) + "/" + strings.Join(segments, "/")
+}
+
+func createShareCodeForUpload(ctx context.Context, uploadID string, filename string, ownerHash string) string {
+	if db == nil {
+		return uploadID
+	}
+
+	for i := 0; i < 5; i++ {
+		code := genCode(8)
+		exp := shareCodeExpiresAt()
+		res, err := db.ExecContext(ctx,
+			"INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads) VALUES($1,$2,$3,$4,$5,$6,0) ON CONFLICT (code) DO NOTHING",
+			code, uploadID, filename, nullableString(ownerHash), exp, maxDownloads)
+		if err == nil {
+			if rows, _ := res.RowsAffected(); rows > 0 {
+				return code
+			}
+		}
+	}
+
+	exp := shareCodeExpiresAt()
+	_, _ = db.ExecContext(ctx, `
+		INSERT INTO share_codes(code, upload_id, filename, owner_key_hash, expires_at, max_downloads, downloads)
+		VALUES($1,$2,$3,$4,$5,$6,0)
+		ON CONFLICT (code) DO UPDATE SET
+			filename = EXCLUDED.filename,
+			owner_key_hash = COALESCE(share_codes.owner_key_hash, EXCLUDED.owner_key_hash)
+	`, uploadID, uploadID, filename, nullableString(ownerHash), exp, maxDownloads)
+	return uploadID
+}
+
+func finalizeMultipartUpload(c *gin.Context) {
+	if s3Client == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "S3 storage is required for multipart finalize"})
+		return
+	}
+
+	var req FinalizeMultipartRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid finalize request"})
+		return
+	}
+
+	req.Filename = strings.TrimSpace(req.Filename)
+	if req.Filename == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "filename is required"})
+		return
+	}
+	if req.TotalSize <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "total_size must be greater than zero"})
+		return
+	}
+	if len(req.Chunks) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chunks are required"})
+		return
+	}
+	if len(req.Chunks) > maxS3MultipartParts {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many chunks for S3 multipart upload"})
+		return
+	}
+
+	chunks := append([]FinalizeMultipartChunk(nil), req.Chunks...)
+	sort.SliceStable(chunks, func(i, j int) bool {
+		if chunks[i].Index == chunks[j].Index {
+			return chunks[i].Start < chunks[j].Start
+		}
+		return chunks[i].Index < chunks[j].Index
+	})
+
+	seenUploadIDs := make(map[string]bool, len(chunks))
+	expectedStart := int64(0)
+	uploadIDs := make([]string, 0, len(chunks))
+	for i := range chunks {
+		chunks[i].UploadID = normalizeUploadID(strings.TrimSpace(chunks[i].UploadID))
+		if chunks[i].UploadID == "" || !codeRegex.MatchString(chunks[i].UploadID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid chunk upload_id at index %d", i)})
+			return
+		}
+		if seenUploadIDs[chunks[i].UploadID] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("duplicated chunk upload_id at index %d", i)})
+			return
+		}
+		seenUploadIDs[chunks[i].UploadID] = true
+
+		if chunks[i].End == 0 && chunks[i].Size > 0 {
+			chunks[i].End = chunks[i].Start + chunks[i].Size
+		}
+		if chunks[i].Size == 0 {
+			chunks[i].Size = chunks[i].End - chunks[i].Start
+		}
+		if chunks[i].Start != expectedStart || chunks[i].End <= chunks[i].Start || chunks[i].Size != chunks[i].End-chunks[i].Start {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid chunk byte range at index %d", i)})
+			return
+		}
+		if chunks[i].Size > maxS3MultipartPartSize {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("chunk %d exceeds the 5GB S3 multipart part limit", i)})
+			return
+		}
+
+		expectedStart = chunks[i].End
+		uploadIDs = append(uploadIDs, chunks[i].UploadID)
+	}
+	if expectedStart != req.TotalSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chunks do not cover total_size"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+	defer cancel()
+
+	ownerHash := ""
+	if value, exists := c.Get("api_key_hash"); exists {
+		if hash, ok := value.(string); ok {
+			ownerHash = hash
+		}
+	}
+	isAdmin, _ := c.Get("is_admin")
+
+	sourceKeys := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		upload, err := dataStore.GetUpload(ctx, chunk.UploadID)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d is not available", i)})
+			return
+		}
+
+		info, err := upload.GetInfo(ctx)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d metadata is not available", i)})
+			return
+		}
+		if info.IsPartial || info.IsFinal || info.Offset < info.Size {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d is not completed", i)})
+			return
+		}
+		if info.Size != chunk.Size {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d size mismatch", i)})
+			return
+		}
+
+		if db != nil && ownerHash != "" && isAdmin != true {
+			chunkOwnerHash := ownerHashForUpload(ctx, chunk.UploadID)
+			if chunkOwnerHash != "" && chunkOwnerHash != ownerHash {
+				c.JSON(http.StatusForbidden, gin.H{"error": "chunk ownership mismatch"})
+				return
+			}
+		}
+
+		key, err := resolveS3ObjectKey(ctx, chunk.UploadID)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("chunk %d object is not available", i)})
+			return
+		}
+		sourceKeys[i] = key
+	}
+
+	if ownerHash == "" && len(uploadIDs) > 0 {
+		ownerHash = ownerHashForUpload(ctx, uploadIDs[0])
+	}
+
+	finalUploadID := "final-" + genCode(24)
+	contentType := strings.TrimSpace(req.Filetype)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	createOut, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:      aws.String(s3Bucket),
+		Key:         aws.String(finalUploadID),
+		ContentType: aws.String(contentType),
+		Metadata: map[string]string{
+			"filecodebox-finalized": "true",
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to create multipart upload for %s: %v", finalUploadID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start S3 multipart compose"})
+		return
+	}
+	if createOut.UploadId == nil || *createOut.UploadId == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "S3 multipart upload id is empty"})
+		return
+	}
+	s3MultipartUploadID := *createOut.UploadId
+
+	abortMultipart := func() {
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer abortCancel()
+		_, abortErr := s3Client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s3Bucket),
+			Key:      aws.String(finalUploadID),
+			UploadId: aws.String(s3MultipartUploadID),
+		})
+		if abortErr != nil {
+			log.Printf("Failed to abort multipart upload %s: %v", finalUploadID, abortErr)
+		}
+	}
+
+	completedParts := make([]types.CompletedPart, len(sourceKeys))
+	for i, key := range sourceKeys {
+		partNumber := int32(i + 1)
+		copyOut, err := s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket:     aws.String(s3Bucket),
+			Key:        aws.String(finalUploadID),
+			UploadId:   aws.String(s3MultipartUploadID),
+			PartNumber: aws.Int32(partNumber),
+			CopySource: aws.String(escapedS3CopySource(s3Bucket, key)),
+		})
+		if err != nil {
+			abortMultipart()
+			log.Printf("Failed to copy chunk %d (%s) into %s: %v", i, key, finalUploadID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to copy chunk %d", i)})
+			return
+		}
+		if copyOut.CopyPartResult == nil || copyOut.CopyPartResult.ETag == nil || *copyOut.CopyPartResult.ETag == "" {
+			abortMultipart()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("S3 copy result for chunk %d is missing ETag", i)})
+			return
+		}
+
+		completedParts[i] = types.CompletedPart{
+			ETag:       copyOut.CopyPartResult.ETag,
+			PartNumber: aws.Int32(partNumber),
+		}
+	}
+
+	_, err = s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s3Bucket),
+		Key:      aws.String(finalUploadID),
+		UploadId: aws.String(s3MultipartUploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	})
+	if err != nil {
+		abortMultipart()
+		log.Printf("Failed to complete multipart upload for %s: %v", finalUploadID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete S3 multipart compose"})
+		return
+	}
+
+	mu.Lock()
+	codeToUpload[finalUploadID] = UploadRecord{UploadID: finalUploadID, Filename: req.Filename}
+	mu.Unlock()
+	cacheS3ObjectKey(finalUploadID, finalUploadID)
+	aggregateUploadMetrics(finalUploadID, uploadIDs)
+	if ownerHash != "" {
+		rememberUploadOwner(finalUploadID, ownerHash)
+	}
+	code := createShareCodeForUpload(ctx, finalUploadID, req.Filename, ownerHash)
+
+	response := shareCodeResponse(finalUploadID, code, req.Filename)
+	response["upload_id"] = finalUploadID
+	c.JSON(http.StatusOK, response)
+}
+
 func getShareCode(c *gin.Context) {
     var req struct {
         UploadID string `json:"upload_id" binding:"required"`
@@ -1332,6 +1678,14 @@ func getShareCode(c *gin.Context) {
         c.JSON(400, gin.H{"error": "upload_id is required"})
         return
     }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if isBusinessMultipartUpload(ctx, req.UploadID) {
+		cancel()
+		c.JSON(400, gin.H{"error": "Business multipart chunks cannot be shared directly"})
+		return
+	}
+	cancel()
 
 	refreshCompletedUploadRuntimeInfo(req.UploadID)
 
@@ -1468,6 +1822,10 @@ func retrieveFile(c *gin.Context) {
             c.JSON(404, gin.H{"error": "Code not found"})
             return
         }
+		if isBusinessMultipartChunk(info.MetaData) {
+			c.JSON(404, gin.H{"error": "Code not found"})
+			return
+		}
         resolved := extractFilename(info.MetaData)
         exp := shareCodeExpiresAt()
         // Insert mapping and avoid hijacking existing short codes by only updating
@@ -1490,6 +1848,10 @@ func retrieveFile(c *gin.Context) {
     if !exists {
         if upload, err := dataStore.GetUpload(context.Background(), code); err == nil {
             if info, err := upload.GetInfo(context.Background()); err == nil {
+				if isBusinessMultipartChunk(info.MetaData) {
+					c.JSON(404, gin.H{"error": "Code not found"})
+					return
+				}
                 record = UploadRecord{
                     UploadID: code,
                     Filename: extractFilename(info.MetaData),
@@ -1636,6 +1998,9 @@ func refreshCompletedUploadRuntimeInfo(uploadID string) {
 
 	info, err := upload.GetInfo(context.Background())
 	if err != nil || info.IsPartial {
+		return
+	}
+	if isBusinessMultipartChunk(info.MetaData) {
 		return
 	}
 
