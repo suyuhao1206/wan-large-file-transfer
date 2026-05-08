@@ -53,6 +53,7 @@ var (
     s3KeyCache   = make(map[string]string)
 	uploadMetrics = make(map[string]UploadMetric)
 	mergeTasks    sync.Map
+	s3PartCopyLimiter = make(chan struct{}, maxS3PartCopyConcurrency)
     mu           sync.RWMutex
 	metricsMu    sync.RWMutex
     
@@ -1517,11 +1518,13 @@ func recoverInterruptedMergeTasks() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	recoveryMessage := "merge task interrupted by server restart; source chunks were scheduled for cleanup, please upload again"
 	rows, err := db.QueryContext(ctx, `
-		SELECT task_id, upload_id, filename, owner_key_hash, chunk_upload_ids, s3_multipart_upload_id, created_at, updated_at
-		FROM merge_tasks
-		WHERE status=$1
-	`, mergeTaskStatusProcessing)
+		UPDATE merge_tasks
+		SET status=$1, error=$2, updated_at=NOW()
+		WHERE status=$3
+		RETURNING task_id, upload_id, filename, owner_key_hash, chunk_upload_ids, s3_multipart_upload_id, created_at, updated_at
+	`, mergeTaskStatusFailed, recoveryMessage, mergeTaskStatusProcessing)
 	if err != nil {
 		log.Printf("Failed to load interrupted merge tasks: %v", err)
 		return
@@ -1535,7 +1538,7 @@ func recoverInterruptedMergeTasks() {
 		var s3MultipartUploadID sql.NullString
 		task := &MergeTask{
 			Status: mergeTaskStatusFailed,
-			Error:  "merge task interrupted by server restart; source chunks were scheduled for cleanup, please upload again",
+			Error:  recoveryMessage,
 		}
 		if err := rows.Scan(
 			&task.TaskID,
@@ -1563,7 +1566,6 @@ func recoverInterruptedMergeTasks() {
 			abortS3MultipartUpload(task.UploadID, task.S3MultipartUploadID)
 		}
 		cleanupBusinessMultipartChunks(task.ChunkUploadIDs)
-		persistMergeTask(task)
 		recovered += 1
 	}
 	if err := rows.Err(); err != nil {
@@ -2160,7 +2162,6 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 
 	completedParts := make([]types.CompletedPart, len(sourceKeys))
 	copyErrCh := make(chan error, len(sourceKeys))
-	copyLimiter := make(chan struct{}, maxS3PartCopyConcurrency)
 	var copyWg sync.WaitGroup
 	var copyMu sync.Mutex
 
@@ -2169,8 +2170,13 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 		go func(index int, sourceKey string) {
 			defer copyWg.Done()
 
-			copyLimiter <- struct{}{}
-			defer func() { <-copyLimiter }()
+			select {
+			case s3PartCopyLimiter <- struct{}{}:
+				defer func() { <-s3PartCopyLimiter }()
+			case <-ctx.Done():
+				copyErrCh <- fmt.Errorf("chunk %d copy cancelled while waiting for global limiter: %w", index, ctx.Err())
+				return
+			}
 
 			partNumber := int32(index + 1)
 			copyOut, err := s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
