@@ -164,7 +164,10 @@ const finishedChunks = ref(0)
 
 const BUSINESS_CHUNK_SIZE = 5 * 1024 * 1024 * 1024
 const TUS_NETWORK_CHUNK_SIZE = 64 * 1024 * 1024
-const BUSINESS_UPLOAD_CONCURRENCY = 4
+const INITIAL_CONCURRENCY = 1
+const MAX_CONCURRENCY = 4
+const SPEED_THRESHOLD_MBPS = 50
+const CONGESTION_SPEED_MBPS = 10
 const MERGE_POLL_INTERVAL_MS = 3000
 const MERGE_POLL_MAX_ERRORS = 20
 const SPEED_WINDOW_MS = 10 * 1000
@@ -192,6 +195,7 @@ let lastSpeedHistorySampleAt = 0
 let lastProgressUiUpdateAt = 0
 let shouldRebaseSpeedWindow = false
 let speedSettlingUntilMs = 0
+let currentConcurrency = INITIAL_CONCURRENCY
 
 const bandwidthUsageWidth = computed(() => {
   const safeUtilization = Number.isFinite(bandwidthUsagePercent.value)
@@ -298,6 +302,37 @@ const calculateMbps = (bytes, durationMs) => {
   return seconds > 0 && bytes > 0 ? (bytes * 8) / seconds / 1000 / 1000 : 0
 }
 
+const resetDynamicConcurrency = () => {
+  currentConcurrency = INITIAL_CONCURRENCY
+}
+
+const forceConcurrencyBackoff = () => {
+  currentConcurrency = INITIAL_CONCURRENCY
+}
+
+const getAverageUploadSpeedMbps = () => {
+  const durationMs = getActiveUploadDurationMs()
+  const measuredBytesUploaded = Math.max(realtimeBytesUploaded, confirmedBytesUploaded, getUploadedBytes())
+  return calculateMbps(measuredBytesUploaded, durationMs)
+}
+
+const evaluateNetworkAndAdjust = () => {
+  const averageSpeedMbps = getAverageUploadSpeedMbps()
+  const previousConcurrency = currentConcurrency
+
+  if (averageSpeedMbps < CONGESTION_SPEED_MBPS) {
+    currentConcurrency = INITIAL_CONCURRENCY
+  } else if (averageSpeedMbps >= SPEED_THRESHOLD_MBPS && currentConcurrency < MAX_CONCURRENCY) {
+    currentConcurrency += 1
+  }
+
+  return {
+    averageSpeedMbps,
+    previousConcurrency,
+    currentConcurrency
+  }
+}
+
 const formatDisplaySpeedMbps = (value) => {
   return formatSpeedMbps(value)
 }
@@ -393,6 +428,7 @@ const resetTransferMetrics = () => {
   lastProgressUiUpdateAt = 0
   shouldRebaseSpeedWindow = false
   speedSettlingUntilMs = 0
+  resetDynamicConcurrency()
 }
 
 const appendSpeedHistory = (sample, force = false) => {
@@ -697,6 +733,7 @@ const uploadChunk = (chunk, token) => {
     const settleReject = (error) => {
       if (settled) return
       settled = true
+      forceConcurrencyBackoff()
       activeUploads.delete(chunk.index)
       reject(error)
     }
@@ -780,18 +817,65 @@ const uploadChunk = (chunk, token) => {
   })
 }
 
-const runConcurrent = async (items, limit, worker) => {
-  let cursor = 0
-  const workerCount = Math.min(limit, items.length)
-  const runners = Array.from({ length: workerCount }, async () => {
-    while (cursor < items.length) {
-      const item = items[cursor]
-      cursor += 1
-      await worker(item)
-    }
-  })
+const runDynamicConcurrent = async (items, worker, token) => {
+  return new Promise((resolve, reject) => {
+    let cursor = 0
+    let activeWorkers = 0
+    let settled = false
+    const results = []
 
-  await Promise.all(runners)
+    const rejectOnce = (error) => {
+      if (settled) return
+      settled = true
+      forceConcurrencyBackoff()
+      reject(error)
+    }
+
+    const resolveIfDrained = () => {
+      if (cursor < items.length || activeWorkers > 0) return false
+
+      settled = true
+      resolve(results)
+      return true
+    }
+
+    const pump = () => {
+      if (settled) return
+
+      if (!isRunActive(token)) {
+        rejectOnce(new Error('upload cancelled'))
+        return
+      }
+
+      // cursor is closed over by every launched worker, so task claiming must stay sync.
+      // Each worker increments activeWorkers before awaiting, then decrements it in finally.
+      while (!settled && activeWorkers < currentConcurrency && cursor < items.length) {
+        const item = items[cursor]
+        cursor += 1
+        activeWorkers += 1
+
+        Promise.resolve()
+          .then(() => worker(item))
+          .then((result) => {
+            results.push(result)
+          })
+          .catch(rejectOnce)
+          .finally(() => {
+            activeWorkers -= 1
+
+            // A completed task is the scheduling event: fill newly available slots
+            // with the latest currentConcurrency, which may have changed in worker().
+            if (!settled && !resolveIfDrained()) {
+              pump()
+            }
+          })
+      }
+
+      resolveIfDrained()
+    }
+
+    pump()
+  })
 }
 
 const sleep = (durationMs) => new Promise(resolve => setTimeout(resolve, durationMs))
@@ -891,13 +975,18 @@ const runUploadWorkflow = async (resume = false) => {
   finalizing.value = false
   shareCode.value = ''
   uploadStatusText.value = resume ? '继续上传' : '正在上传'
+  resetDynamicConcurrency()
   beginActiveUploadTiming(resume)
 
   try {
     const pendingChunks = currentChunks.filter(chunk => !completedChunks[chunk.index])
     if (pendingChunks.length > 0) {
       uploadStatusText.value = `正在上传分片 ${finishedChunks.value + 1}/${totalChunks.value}`
-      await runConcurrent(pendingChunks, BUSINESS_UPLOAD_CONCURRENCY, chunk => uploadChunk(chunk, token))
+      await runDynamicConcurrent(pendingChunks, async (chunk) => {
+        const uploadedChunk = await uploadChunk(chunk, token)
+        evaluateNetworkAndAdjust()
+        return uploadedChunk
+      }, token)
     }
 
     if (!isRunActive(token)) return
@@ -908,6 +997,7 @@ const runUploadWorkflow = async (resume = false) => {
     if (token !== runToken || paused.value) return
 
     console.error('Upload error:', err)
+    forceConcurrencyBackoff()
     await abortActiveUploads(false, 'upload failed')
     stopActiveUploadTiming()
     finalizing.value = false
