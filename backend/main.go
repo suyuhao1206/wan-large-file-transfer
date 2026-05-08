@@ -39,6 +39,9 @@ const (
 	maxS3MultipartPartSize   = int64(5 * 1024 * 1024 * 1024)
 	maxS3PartCopyConcurrency = 16
 	mergeTaskCleanupDelay     = 5 * time.Minute
+	mergeTaskMinTimeout       = 30 * time.Minute
+	mergeTaskBaseTimeout      = 10 * time.Minute
+	mergeTaskPerChunkTimeout  = 5 * time.Second
 	mergeTaskStatusProcessing = "processing"
 	mergeTaskStatusSuccess    = "success"
 	mergeTaskStatusFailed     = "failed"
@@ -91,16 +94,18 @@ type FinalizeMultipartRequest struct {
 }
 
 type MergeTask struct {
-	mu        sync.RWMutex
-	TaskID    string
-	Status    string
-	UploadID  string
-	Code      string
-	Filename  string
-	OwnerHash string
-	Error     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	mu                  sync.RWMutex
+	TaskID              string
+	Status              string
+	UploadID            string
+	Code                string
+	Filename            string
+	OwnerHash           string
+	Error               string
+	ChunkUploadIDs      []string
+	S3MultipartUploadID string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type UploadMetric struct {
@@ -211,6 +216,23 @@ func main() {
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )`)
                 _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_upload_owners_owner ON upload_owners(owner_key_hash)`)
+                _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS merge_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    upload_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    owner_key_hash TEXT,
+                    status TEXT NOT NULL,
+                    code TEXT,
+                    error TEXT,
+                    chunk_upload_ids TEXT NOT NULL DEFAULT '',
+                    s3_multipart_upload_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )`)
+                _, _ = db.Exec(`ALTER TABLE merge_tasks ADD COLUMN IF NOT EXISTS chunk_upload_ids TEXT NOT NULL DEFAULT ''`)
+                _, _ = db.Exec(`ALTER TABLE merge_tasks ADD COLUMN IF NOT EXISTS s3_multipart_upload_id TEXT`)
+                _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_merge_tasks_status ON merge_tasks(status)`)
+                _, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_merge_tasks_owner ON merge_tasks(owner_key_hash)`)
                 
                 // Create API keys table
                 _, _ = db.Exec(`CREATE TABLE IF NOT EXISTS api_keys (
@@ -304,6 +326,8 @@ func main() {
 		composer = handler.NewStoreComposer()
 		store.UseIn(composer)
 	}
+
+	recoverInterruptedMergeTasks()
 
 	// Create tusd handler
 	tusConfig := handler.Config{
@@ -1468,6 +1492,88 @@ func cleanupBusinessMultipartChunks(uploadIDs []string) {
 	}()
 }
 
+func abortS3MultipartUpload(objectKey string, multipartUploadID string) {
+	if s3Client == nil || objectKey == "" || multipartUploadID == "" {
+		return
+	}
+
+	abortCtx, abortCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer abortCancel()
+	_, abortErr := s3Client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s3Bucket),
+		Key:      aws.String(objectKey),
+		UploadId: aws.String(multipartUploadID),
+	})
+	if abortErr != nil {
+		log.Printf("Failed to abort multipart upload %s: %v", objectKey, abortErr)
+	}
+}
+
+func recoverInterruptedMergeTasks() {
+	if db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT task_id, upload_id, filename, owner_key_hash, chunk_upload_ids, s3_multipart_upload_id, created_at, updated_at
+		FROM merge_tasks
+		WHERE status=$1
+	`, mergeTaskStatusProcessing)
+	if err != nil {
+		log.Printf("Failed to load interrupted merge tasks: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	recovered := 0
+	for rows.Next() {
+		var ownerHash sql.NullString
+		var chunkUploadIDs string
+		var s3MultipartUploadID sql.NullString
+		task := &MergeTask{
+			Status: mergeTaskStatusFailed,
+			Error:  "merge task interrupted by server restart; source chunks were scheduled for cleanup, please upload again",
+		}
+		if err := rows.Scan(
+			&task.TaskID,
+			&task.UploadID,
+			&task.Filename,
+			&ownerHash,
+			&chunkUploadIDs,
+			&s3MultipartUploadID,
+			&task.CreatedAt,
+			&task.UpdatedAt,
+		); err != nil {
+			log.Printf("Failed to scan interrupted merge task: %v", err)
+			continue
+		}
+		if ownerHash.Valid {
+			task.OwnerHash = ownerHash.String
+		}
+		if s3MultipartUploadID.Valid {
+			task.S3MultipartUploadID = s3MultipartUploadID.String
+		}
+		task.ChunkUploadIDs = decodeMergeTaskUploadIDs(chunkUploadIDs)
+		task.UpdatedAt = time.Now().UTC()
+
+		if task.S3MultipartUploadID != "" {
+			abortS3MultipartUpload(task.UploadID, task.S3MultipartUploadID)
+		}
+		cleanupBusinessMultipartChunks(task.ChunkUploadIDs)
+		persistMergeTask(task)
+		recovered += 1
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Failed while reading interrupted merge tasks: %v", err)
+	}
+	if recovered > 0 {
+		log.Printf("Recovered %d interrupted merge task(s)", recovered)
+	}
+}
+
 func escapedS3CopySource(bucket string, key string) string {
 	segments := strings.Split(key, "/")
 	for i, segment := range segments {
@@ -1519,6 +1625,137 @@ func newMergeTask(taskID string, filename string, ownerHash string) *MergeTask {
 	}
 }
 
+func mergeTaskTimeout(chunkCount int) time.Duration {
+	timeout := mergeTaskBaseTimeout + time.Duration(chunkCount)*mergeTaskPerChunkTimeout
+	if timeout < mergeTaskMinTimeout {
+		return mergeTaskMinTimeout
+	}
+	return timeout
+}
+
+func encodeMergeTaskUploadIDs(uploadIDs []string) string {
+	if len(uploadIDs) == 0 {
+		return ""
+	}
+	cleanIDs := make([]string, 0, len(uploadIDs))
+	for _, uploadID := range uploadIDs {
+		uploadID = normalizeUploadID(strings.TrimSpace(uploadID))
+		if uploadID != "" {
+			cleanIDs = append(cleanIDs, uploadID)
+		}
+	}
+	return strings.Join(cleanIDs, ",")
+}
+
+func decodeMergeTaskUploadIDs(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	uploadIDs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		uploadID := normalizeUploadID(strings.TrimSpace(part))
+		if uploadID != "" {
+			uploadIDs = append(uploadIDs, uploadID)
+		}
+	}
+	return uploadIDs
+}
+
+func persistMergeTask(task *MergeTask) {
+	if db == nil || task == nil {
+		return
+	}
+
+	task.mu.RLock()
+	taskID := task.TaskID
+	uploadID := task.UploadID
+	filename := task.Filename
+	ownerHash := task.OwnerHash
+	status := task.Status
+	code := task.Code
+	errMessage := task.Error
+	chunkUploadIDs := encodeMergeTaskUploadIDs(task.ChunkUploadIDs)
+	s3MultipartUploadID := task.S3MultipartUploadID
+	createdAt := task.CreatedAt
+	updatedAt := task.UpdatedAt
+	task.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO merge_tasks(task_id, upload_id, filename, owner_key_hash, status, code, error, chunk_upload_ids, s3_multipart_upload_id, created_at, updated_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		ON CONFLICT (task_id) DO UPDATE SET
+			upload_id = EXCLUDED.upload_id,
+			filename = EXCLUDED.filename,
+			owner_key_hash = EXCLUDED.owner_key_hash,
+			status = EXCLUDED.status,
+			code = EXCLUDED.code,
+			error = EXCLUDED.error,
+			chunk_upload_ids = EXCLUDED.chunk_upload_ids,
+			s3_multipart_upload_id = EXCLUDED.s3_multipart_upload_id,
+			updated_at = EXCLUDED.updated_at
+	`, taskID, uploadID, filename, nullableString(ownerHash), status, nullableString(code), nullableString(errMessage), chunkUploadIDs, nullableString(s3MultipartUploadID), createdAt, updatedAt)
+	if err != nil {
+		log.Printf("Failed to persist merge task %s: %v", taskID, err)
+	}
+}
+
+func loadPersistedMergeTask(taskID string) (*MergeTask, bool) {
+	if db == nil || taskID == "" {
+		return nil, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var ownerHash sql.NullString
+	var code sql.NullString
+	var errMessage sql.NullString
+	var chunkUploadIDs string
+	var s3MultipartUploadID sql.NullString
+	task := &MergeTask{}
+	err := db.QueryRowContext(ctx, `
+		SELECT task_id, upload_id, filename, owner_key_hash, status, code, error, chunk_upload_ids, s3_multipart_upload_id, created_at, updated_at
+		FROM merge_tasks
+		WHERE task_id=$1
+	`, taskID).Scan(
+		&task.TaskID,
+		&task.UploadID,
+		&task.Filename,
+		&ownerHash,
+		&task.Status,
+		&code,
+		&errMessage,
+		&chunkUploadIDs,
+		&s3MultipartUploadID,
+		&task.CreatedAt,
+		&task.UpdatedAt,
+	)
+	if err != nil {
+		return nil, false
+	}
+
+	if ownerHash.Valid {
+		task.OwnerHash = ownerHash.String
+	}
+	if code.Valid {
+		task.Code = code.String
+	}
+	if errMessage.Valid {
+		task.Error = errMessage.String
+	}
+	if s3MultipartUploadID.Valid {
+		task.S3MultipartUploadID = s3MultipartUploadID.String
+	}
+	task.ChunkUploadIDs = decodeMergeTaskUploadIDs(chunkUploadIDs)
+
+	return task, true
+}
+
 func (task *MergeTask) status() string {
 	task.mu.RLock()
 	defer task.mu.RUnlock()
@@ -1545,6 +1782,7 @@ func (task *MergeTask) markSuccess(code string) {
 	task.UpdatedAt = time.Now().UTC()
 	task.mu.Unlock()
 
+	persistMergeTask(task)
 	task.scheduleCleanup()
 }
 
@@ -1560,6 +1798,7 @@ func (task *MergeTask) markFailed(err error) {
 	task.UpdatedAt = time.Now().UTC()
 	task.mu.Unlock()
 
+	persistMergeTask(task)
 	task.scheduleCleanup()
 }
 
@@ -1574,6 +1813,21 @@ func (task *MergeTask) setOwnerHash(ownerHash string) {
 	}
 	task.UpdatedAt = time.Now().UTC()
 	task.mu.Unlock()
+
+	persistMergeTask(task)
+}
+
+func (task *MergeTask) setS3MultipartUploadID(uploadID string) {
+	if uploadID == "" {
+		return
+	}
+
+	task.mu.Lock()
+	task.S3MultipartUploadID = uploadID
+	task.UpdatedAt = time.Now().UTC()
+	task.mu.Unlock()
+
+	persistMergeTask(task)
 }
 
 func mergeTaskResponse(task *MergeTask) gin.H {
@@ -1781,6 +2035,7 @@ func finalizeMultipartUpload(c *gin.Context) {
 	}
 
 	task := newMergeTask(taskID, req.Filename, ownerHash)
+	task.ChunkUploadIDs = append([]string(nil), uploadIDs...)
 	actual, loaded := mergeTasks.LoadOrStore(taskID, task)
 	if loaded {
 		existingTask := actual.(*MergeTask)
@@ -1806,6 +2061,7 @@ func finalizeMultipartUpload(c *gin.Context) {
 		}
 	}
 
+	persistMergeTask(task)
 	go runFinalizeMultipartTask(task, req, chunks, uploadIDs, ownerHash, isAdmin)
 
 	response := mergeTaskResponse(task)
@@ -1814,8 +2070,24 @@ func finalizeMultipartUpload(c *gin.Context) {
 }
 
 func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chunks []FinalizeMultipartChunk, uploadIDs []string, ownerHash string, isAdmin bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), mergeTaskTimeout(len(chunks)))
 	defer cancel()
+
+	cleanupOriginalChunksOnExit := false
+	mergeSucceeded := false
+	sourceChunksCleaned := false
+	cleanupSourceChunks := func() {
+		if sourceChunksCleaned {
+			return
+		}
+		sourceChunksCleaned = true
+		cleanupBusinessMultipartChunks(uploadIDs)
+	}
+	defer func() {
+		if cleanupOriginalChunksOnExit && !mergeSucceeded {
+			cleanupSourceChunks()
+		}
+	}()
 
 	sourceKeys := make([]string, len(chunks))
 	for i, chunk := range chunks {
@@ -1854,6 +2126,7 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 		}
 		sourceKeys[i] = key
 	}
+	cleanupOriginalChunksOnExit = true
 
 	if ownerHash == "" && len(uploadIDs) > 0 {
 		ownerHash = ownerHashForUpload(ctx, uploadIDs[0])
@@ -1883,19 +2156,7 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 		return
 	}
 	s3MultipartUploadID := *createOut.UploadId
-
-	abortMultipart := func() {
-		abortCtx, abortCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer abortCancel()
-		_, abortErr := s3Client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(s3Bucket),
-			Key:      aws.String(task.UploadID),
-			UploadId: aws.String(s3MultipartUploadID),
-		})
-		if abortErr != nil {
-			log.Printf("Failed to abort multipart upload %s: %v", task.UploadID, abortErr)
-		}
-	}
+	task.setS3MultipartUploadID(s3MultipartUploadID)
 
 	completedParts := make([]types.CompletedPart, len(sourceKeys))
 	copyErrCh := make(chan error, len(sourceKeys))
@@ -1940,7 +2201,7 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 	copyWg.Wait()
 	close(copyErrCh)
 	if err := <-copyErrCh; err != nil {
-		abortMultipart()
+		abortS3MultipartUpload(task.UploadID, s3MultipartUploadID)
 		log.Printf("Failed to copy chunks into %s: %v", task.UploadID, err)
 		task.markFailed(err)
 		return
@@ -1955,7 +2216,7 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 		},
 	})
 	if err != nil {
-		abortMultipart()
+		abortS3MultipartUpload(task.UploadID, s3MultipartUploadID)
 		log.Printf("Failed to complete multipart upload for %s: %v", task.UploadID, err)
 		task.markFailed(fmt.Errorf("failed to complete S3 multipart compose: %w", err))
 		return
@@ -1966,7 +2227,8 @@ func runFinalizeMultipartTask(task *MergeTask, req FinalizeMultipartRequest, chu
 	mu.Unlock()
 	cacheS3ObjectKey(task.UploadID, task.UploadID)
 	aggregateUploadMetrics(task.UploadID, uploadIDs)
-	cleanupBusinessMultipartChunks(uploadIDs)
+	mergeSucceeded = true
+	cleanupSourceChunks()
 	if ownerHash != "" {
 		rememberUploadOwner(task.UploadID, ownerHash)
 	}
@@ -1983,6 +2245,15 @@ func getMergeStatus(c *gin.Context) {
 
 	if value, exists := mergeTasks.Load(taskID); exists {
 		task := value.(*MergeTask)
+		if !canAccessMergeTask(c, task) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "merge task ownership mismatch"})
+			return
+		}
+		c.JSON(http.StatusOK, mergeTaskResponse(task))
+		return
+	}
+
+	if task, exists := loadPersistedMergeTask(taskID); exists {
 		if !canAccessMergeTask(c, task) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "merge task ownership mismatch"})
 			return

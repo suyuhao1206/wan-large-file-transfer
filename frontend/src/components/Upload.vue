@@ -137,7 +137,7 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import * as tus from 'tus-js-client'
 import axios from 'axios'
 import { CopyDocument, UploadFilled } from '@element-plus/icons-vue'
@@ -209,10 +209,7 @@ const speedChartBars = computed(() => {
 
   const visibleHistory = speedHistory.value.slice(-SPEED_HISTORY_BAR_COUNT)
   const emptySlotCount = Math.max(0, SPEED_HISTORY_BAR_COUNT - visibleHistory.length)
-  const maxSpeed = Math.max(
-    FIXED_BANDWIDTH_MBPS,
-    ...visibleHistory.map(sample => sample.mbps)
-  )
+  const maxSpeed = Math.max(10, ...visibleHistory.map(sample => sample.mbps))
 
   return [
     ...Array(emptySlotCount).fill(null),
@@ -398,6 +395,8 @@ const copyShareCode = async () => {
       textarea.value = shareCode.value
       textarea.setAttribute('readonly', '')
       textarea.style.position = 'fixed'
+      textarea.style.top = '0'
+      textarea.style.left = '0'
       textarea.style.opacity = '0'
       document.body.appendChild(textarea)
       textarea.select()
@@ -1078,6 +1077,20 @@ const stopUpload = async () => {
     ElMessage.error(`停止上传失败: ${err.response?.data?.error || err.message}`)
   }
 }
+
+onBeforeUnmount(() => {
+  runToken += 1
+  stopActiveUploadTiming()
+
+  const tasks = Array.from(activeUploads.values())
+  activeUploads.clear()
+  tasks.forEach((task) => {
+    Promise.resolve(task.upload.abort(false)).catch((err) => {
+      console.warn('Abort upload on unmount failed:', err)
+    })
+    task.reject(new Error('component unmounted'))
+  })
+})
 </script>
 
 <style scoped>
